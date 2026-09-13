@@ -1,0 +1,131 @@
+[project]
+name = "replayable-agent-runtime"
+version = "0.1.0"
+description = "Durable execution for LLM agents: an append-only, hash-chained SQLite journal with deterministic replay, fenced worker leases, a transactional outbox and saga compensations."
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "Rouviere German" }]
+requires-python = ">=3.12,<3.13"
+dependencies = [
+    # --- core (every repo) ---
+    "fastapi>=0.115",
+    "uvicorn>=0.30",
+    "pydantic>=2.9",
+    "pydantic-settings>=2.7",
+    "structlog>=24.4",
+    "opentelemetry-api>=1.27",
+    "opentelemetry-sdk>=1.27",
+    "prometheus-client>=0.21",
+    # --- agentic kit ---
+    "anthropic>=1.0,<2",
+    # --- durable runtime ---
+    "sqlalchemy>=2.0.36,<3",
+    "alembic>=1.14,<2",
+    "pyjwt>=2.10,<3",
+]
+
+[project.scripts]
+rar = "replayable_agent_runtime.cli:main"
+replayable-agent-runtime = "replayable_agent_runtime.cli:main"
+
+[dependency-groups]
+dev = [
+    "pytest>=8.3",
+    "pytest-cov>=6.0",
+    "hypothesis>=6.115",
+    "httpx>=0.27",
+    "ruff>=0.8",
+    "mypy>=1.13",
+    "bandit[toml]>=1.8",
+]
+
+[build-system]
+requires = ["uv_build>=0.8,<0.13"]
+build-backend = "uv_build"
+
+# Baseline metadata consumed by scripts/check_baseline.py.
+# kind: "template" (both kits), "agentic" or "ml".
+[tool.portfolio]
+kind = "agentic"
+package = "replayable_agent_runtime"
+
+# pip-audit has no native config file; tasks.py and CI read this list.
+# Every entry needs a justification and a review date.
+[tool.portfolio.audit]
+ignore_vulns = []
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+src = ["src", "tests", "scripts", "bench"]
+
+[tool.ruff.lint]
+select = [
+    "E", "W", "F", "I", "B", "UP", "S", "N", "SIM", "C4", "RUF", "PT", "PL", "TRY", "BLE", "DTZ", "T20",
+]
+ignore = [
+    "PLR0913",  # explicit keyword-heavy constructors are fine
+    "PLR2004",  # magic numbers in tests and thresholds
+    "TRY003",   # messages in exception constructors are fine
+    # The replay engine is an explicit state machine: each early return / branch is a distinct,
+    # named history state (recorded, rejected, cancelled, in-flight, live). Splitting them to
+    # satisfy counters would hide the case analysis that the tests enumerate.
+    "PLR0911",
+    "PLR0912",
+    "PLR0915",
+    "PLR0917",
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["S101", "S105", "S106", "S311", "PLR2004", "PLC0415", "S603"]
+"scripts/**" = ["T201"]
+"bench/**" = ["T201", "S311", "S603"]
+"tasks.py" = ["T201", "S603", "S607"]
+"src/replayable_agent_runtime/cli.py" = ["T201"]
+"src/replayable_agent_runtime/runtime/migrations/**" = ["N999", "INP001"]
+
+[tool.ruff.format]
+quote-style = "double"
+
+[tool.mypy]
+strict = true
+python_version = "3.12"
+files = ["src", "tests", "scripts", "bench", "tasks.py"]
+plugins = ["pydantic.mypy"]
+warn_unreachable = true
+
+[[tool.mypy.overrides]]
+module = ["anthropic", "anthropic.*"]
+# Imported lazily; type-checked when the SDK is installed (it is, via the agentic kit).
+follow_imports = "silent"
+
+[tool.pytest.ini_options]
+minversion = "8.0"
+testpaths = ["tests"]
+addopts = ["-ra", "--strict-markers", "--strict-config"]
+markers = [
+    "unit: fast, isolated tests with no I/O beyond tmp_path",
+    "integration: tests that wire several components (journal, workers, app, CLI) together",
+    "chaos: subprocess SIGKILL tests (slower; the full 200-seed run is bench/chaos_sigkill.py)",
+]
+filterwarnings = ["error::DeprecationWarning:replayable_agent_runtime.*"]
+
+[tool.coverage.run]
+source = ["replayable_agent_runtime"]
+branch = true
+omit = ["*/runtime/migrations/env.py"]
+
+[tool.coverage.report]
+fail_under = 85
+show_missing = true
+skip_covered = true
+exclude_also = [
+    "if TYPE_CHECKING:",
+    "raise NotImplementedError",
+    "\\.\\.\\.$",
+]
+
+[tool.bandit]
+exclude_dirs = ["tests", ".venv"]
+skips = []
