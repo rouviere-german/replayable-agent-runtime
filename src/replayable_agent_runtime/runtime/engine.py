@@ -119,7 +119,11 @@ async def _drive(
         try:
             result = await state.definition.fn(ctx, claim.run.input)
         except WorkflowCancelled:
+            # Divergence is checked before compensating, so a bad deploy blocks in-flight runs
+            # instead of failing them and rolling back their effects.
+            ctx.ensure_only_compensations_remain()
             failed = await ctx.run_compensations()
+            ctx.ensure_history_consumed()
             state.mark_head()
             journal.finish(
                 lease,
@@ -128,7 +132,9 @@ async def _drive(
             )
             return outcome("cancelled")
         except Exception as exc:  # noqa: BLE001 - a workflow exception fails the run
+            ctx.ensure_only_compensations_remain()
             failed = await ctx.run_compensations()
+            ctx.ensure_history_consumed()
             state.mark_head()
             message = redact_text(str(exc))[:500]
             error: dict[str, JsonValue] = {
@@ -202,6 +208,7 @@ async def replay_check(runtime: Runtime, run_id: str) -> ActivationOutcome:
             await definition.fn(ctx, run.input)
         except (WorkflowCancelled, Exception) as exc:  # noqa: BLE001 - recorded failures replay too
             # The engine compensated after this failure; replay those commands too.
+            ctx.ensure_only_compensations_remain()
             await ctx.run_compensations()
             ctx.ensure_history_consumed()
             return ActivationOutcome(run_id, "failed", 0, type(exc).__name__)

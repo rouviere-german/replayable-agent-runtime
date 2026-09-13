@@ -274,6 +274,95 @@ def test_nondeterministic_code_blocks_the_run_until_an_operator_retries(harness:
     assert drive(harness, run_id).status is RunStatus.COMPLETED
 
 
+async def ticket_then_gate(ctx: WorkflowContext, value: JsonValue) -> JsonValue:
+    created = await ctx.tool("create_ticket", {"title": "deploy", "body": "rollout"})
+    assert isinstance(created, dict)
+    ctx.compensate("close_ticket", {"ticket_id": str(created["ticket_id"])})
+    await ctx.tool("kb_lookup", {"key": "cache"})
+    await ctx.await_approval("ship", {"env": "prod"})
+    return "shipped"
+
+
+async def ticket_then_raise(ctx: WorkflowContext, value: JsonValue) -> JsonValue:
+    created = await ctx.tool("create_ticket", {"title": "deploy", "body": "rollout"})
+    assert isinstance(created, dict)
+    ctx.compensate("close_ticket", {"ticket_id": str(created["ticket_id"])})
+    raise ValueError("validation added in v2")
+
+
+async def ticket_then_raise_uncompensated(ctx: WorkflowContext, value: JsonValue) -> JsonValue:
+    await ctx.tool("create_ticket", {"title": "deploy", "body": "rollout"})
+    raise ValueError("validation added in v2")
+
+
+@pytest.mark.parametrize("inbox", ["approval", "cancel"])
+@pytest.mark.parametrize("new_code", [ticket_then_raise_uncompensated, ticket_then_raise])
+def test_new_code_that_raises_before_the_head_blocks_the_run_instead_of_failing_it(
+    harness: Harness, inbox: str, new_code: Any
+) -> None:
+    """Regression: an exception during replay used to fail the run and run its compensations."""
+    tools = frozenset({"create_ticket", "close_ticket", "kb_lookup"})
+    harness.register("deploy", ticket_then_gate, tools)
+    run_id = harness.start("deploy")
+    assert asyncio.run(harness.worker().run_once(run_id=run_id)) is not None
+    harness.approve_pending(run_id)
+    parked = asyncio.run(harness.worker().run_once(run_id=run_id))
+    assert parked is not None
+    assert parked.outcome == "waiting"
+    if inbox == "approval":
+        harness.approve_pending(run_id)
+    else:
+        harness.control.cancel(run_id)
+    before = types_of(harness.journal, run_id)
+    assert before[-1] == "ApprovalRequested"
+
+    harness.workflows = WorkflowRegistry([WorkflowDefinition("deploy", new_code, tools)])
+    outcome = asyncio.run(harness.worker().run_once(run_id=run_id))
+    assert outcome is not None
+    assert outcome.outcome == "blocked"
+    run = harness.journal.get_run(run_id)
+    assert run.status is RunStatus.BLOCKED
+    assert run.blocked_reason is not None
+    assert "nondeterminism" in run.blocked_reason
+    assert types_of(harness.journal, run_id) == before
+    assert [entry.op for entry in harness.sinks.ledger(run_id)] == ["create"]
+    assert harness.journal_metrics().nondeterminism_errors_total._value.get() == 1
+    with pytest.raises(NonDeterminismError):
+        asyncio.run(replay_check(harness.runtime(), run_id))
+
+
+async def ticket_then_fail(ctx: WorkflowContext, value: JsonValue) -> JsonValue:
+    created = await ctx.tool("create_ticket", {"title": "deploy", "body": "rollout"})
+    assert isinstance(created, dict)
+    ctx.compensate("close_ticket", {"ticket_id": str(created["ticket_id"])})
+    raise RuntimeError("rollout failed")
+
+
+@pytest.mark.parametrize("crash_seq", [5, 6])
+def test_a_crash_during_compensation_still_replays_the_recorded_rollback(
+    harness: Harness, crash_seq: int
+) -> None:
+    """Recorded compensations after a replayed failure are history, not divergence."""
+    harness.register("failing", ticket_then_fail, frozenset({"create_ticket", "close_ticket"}))
+    run_id = harness.start("failing")
+    assert asyncio.run(harness.worker().run_once(run_id=run_id)) is not None
+    harness.approve_pending(run_id)
+    injector = CrashInjector([CrashPoint("after_commit", crash_seq)])
+    harness.journal.append_hooks.append(injector.append_hook)
+    with pytest.raises(SimulatedCrash):
+        asyncio.run(harness.worker().run_once(run_id=run_id))
+    harness.journal.append_hooks.clear()
+    compensation = harness.journal.load_history(run_id)[5]
+    assert compensation.data()["kind"] == "compensation"
+    harness.clock.advance(31)
+    run = drive(harness, run_id)
+    assert run.status is RunStatus.FAILED
+    assert run.error is not None
+    assert (run.error["error_type"], run.error["compensations_failed"]) == ("RuntimeError", 0)
+    assert [entry.op for entry in harness.sinks.ledger(run_id)] == ["create", "close"]
+    assert asyncio.run(replay_check(harness.runtime(), run_id)).outcome == "failed"
+
+
 async def patched_version(ctx: WorkflowContext, value: JsonValue) -> JsonValue:
     key = "v2" if ctx.patched("new-key") else "v1"
     fact = await ctx.tool("kb_lookup", {"key": key})

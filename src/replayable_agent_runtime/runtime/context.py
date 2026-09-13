@@ -1006,7 +1006,7 @@ class WorkflowContext:
         return True
 
     def ensure_history_consumed(self) -> None:
-        """At completion, recorded commands the workflow did not re-issue mean it diverged."""
+        """When the workflow finishes, recorded commands it did not re-issue mean it diverged."""
         state = self._state
         for command in range(state.next_command, state.recorded_commands):
             records = state.commands.get(command, [])
@@ -1014,5 +1014,25 @@ class WorkflowContext:
                 raise NonDeterminismError(
                     self.run_id,
                     command,
-                    "workflow completed but the history records more commands",
+                    "workflow finished but the history records more commands",
+                )
+
+    def ensure_only_compensations_remain(self) -> None:
+        """Called when workflow code raised or was cancelled, before anything is compensated.
+
+        The only commands an earlier activation can have recorded after the point where the same
+        code raised are the compensations it ran for that failure. Any other recorded command means
+        the code now raises where it used to continue, so the run diverged: it must be blocked, not
+        failed and rolled back.
+        """
+        state = self._state
+        for command in range(state.next_command, state.recorded_commands):
+            records = state.commands.get(command, [])
+            if not records or records[0].type == EventType.PATCH_MARKER:
+                continue
+            if records[0].data().get("kind") != CommandKind.COMPENSATION.value:
+                raise NonDeterminismError(
+                    self.run_id,
+                    command,
+                    "workflow raised but the history records later commands",
                 )
