@@ -143,7 +143,12 @@ class SinkStore:
         self._clock = clock
         self.engine = make_engine(path, synchronous=synchronous, immediate=True)
         self._reader = make_engine(path, synchronous=synchronous, immediate=False)
-        _metadata.create_all(self.engine)
+        try:
+            _metadata.create_all(self.engine)
+        except Exception:
+            # A failed open must not keep the database files open in this process.
+            self.close()
+            raise
 
     def now_us(self) -> int:
         return now_us(self._clock)

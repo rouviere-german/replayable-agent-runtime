@@ -340,7 +340,12 @@ class Journal:
         self._reader = make_engine(path, synchronous=synchronous, immediate=False)
         self.append_hooks: list[AppendHook] = []
         if migrate:
-            self.migrate()
+            try:
+                self.migrate()
+            except Exception:
+                # A failed open must not keep the database files open in this process.
+                self.close()
+                raise
 
     @property
     def path(self) -> Path:

@@ -17,11 +17,16 @@ from __future__ import annotations
 
 import os
 import random
+import shutil
+import sqlite3
 import subprocess  # nosec B404 - only starts this package's own chaos driver with a fixed argv
 import sys
 import time
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from pathlib import Path
+
+from sqlalchemy.exc import OperationalError, SQLAlchemyError
 
 from replayable_agent_runtime.runtime.chaos import (
     ChaosEnvironment,
@@ -30,7 +35,11 @@ from replayable_agent_runtime.runtime.chaos import (
 )
 from replayable_agent_runtime.runtime.events import EventType
 
-__all__ = ["SigkillResult", "run_sigkill_seed"]
+__all__ = ["SigkillResult", "open_with_retry", "run_seeds", "run_sigkill_seed"]
+
+# Errors seen when a seed's own machinery breaks (files still held by a killed process, timeouts):
+# recorded as that seed's failure instead of aborting the remaining seeds.
+_SEED_ERRORS = (OSError, SQLAlchemyError, sqlite3.Error, subprocess.SubprocessError, RuntimeError)
 
 _CLOCK_START = 1_700_000_000.0
 _RECOVERY_CLOCK_OFFSET = 1_000_000.0
@@ -49,12 +58,37 @@ class SigkillResult:
     duplicate_provider_calls: int
     journal_ok: bool
     seconds: float
+    error: str | None = None
 
     @property
     def passed(self) -> bool:
-        if not self.journal_ok or not self.equivalent:
+        if self.error is not None or not self.journal_ok or not self.equivalent:
             return False
         return self.in_effect_window or self.duplicate_provider_calls == 0
+
+
+def open_with_retry[T](
+    open_env: Callable[[], T],
+    *,
+    attempts: int = 10,
+    first_delay: float = 0.05,
+    max_delay: float = 2.0,
+    sleep: Callable[[float], None] = time.sleep,
+) -> T:
+    """Open databases a killed worker was using, retrying while the OS still holds its files.
+
+    On Windows ``TerminateProcess`` can return before the kernel has released the dead process's
+    handles on the journal and its WAL and shared-memory files; opening them in that window fails
+    with ``disk I/O error``. Retries with exponential backoff (about 9 s in total by default).
+    """
+    delay = first_delay
+    for _ in range(attempts - 1):
+        try:
+            return open_env()
+        except (OperationalError, sqlite3.OperationalError):
+            sleep(delay)
+            delay = min(delay * 2, max_delay)
+    return open_env()
 
 
 def _child_environment() -> dict[str, str]:
@@ -115,7 +149,9 @@ def run_sigkill_seed(workdir: Path, seed: int, *, timeout_seconds: float = 180.0
         process.kill()
     process.wait(timeout=60)
 
-    recovery = ChaosEnvironment(crash_dir, clock_start=_CLOCK_START + _RECOVERY_CLOCK_OFFSET)
+    recovery = open_with_retry(
+        lambda: ChaosEnvironment(crash_dir, clock_start=_CLOCK_START + _RECOVERY_CLOCK_OFFSET)
+    )
     try:
         injector = CrashInjector(())
         if killed and kind == "after_effect":
@@ -143,3 +179,43 @@ def run_sigkill_seed(workdir: Path, seed: int, *, timeout_seconds: float = 180.0
         journal_ok=crashed.journal_ok,
         seconds=round(time.perf_counter() - started, 3),
     )
+
+
+def run_seeds(
+    base: Path,
+    seeds: Iterable[int],
+    *,
+    run_seed: Callable[[Path, int], SigkillResult] = run_sigkill_seed,
+    report: Callable[[SigkillResult], None] | None = None,
+) -> list[SigkillResult]:
+    """Run seeds one after another in ``base/seed-<n>``.
+
+    A seed whose harness raises (for example a file a killed worker still holds) is recorded as a
+    failed result with its error, and the remaining seeds still run. Each seed's directory is
+    removed afterwards, best effort.
+    """
+    results: list[SigkillResult] = []
+    for seed in seeds:
+        workdir = base / f"seed-{seed}"
+        started = time.perf_counter()
+        try:
+            result = run_seed(workdir, seed)
+        except _SEED_ERRORS as exc:
+            result = SigkillResult(
+                seed=seed,
+                kill_kind="unknown",
+                kill_at=-1,
+                killed=False,
+                status="error",
+                equivalent=False,
+                in_effect_window=False,
+                duplicate_provider_calls=0,
+                journal_ok=False,
+                seconds=round(time.perf_counter() - started, 3),
+                error=f"{type(exc).__name__}: {exc}"[:500],
+            )
+        shutil.rmtree(workdir, ignore_errors=True)
+        results.append(result)
+        if report is not None:
+            report(result)
+    return results

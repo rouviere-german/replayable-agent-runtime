@@ -328,7 +328,12 @@ class ChaosEnvironment:
         self.workdir.mkdir(parents=True, exist_ok=True)
         self.clock = FakeClock(self.clock_start)
         self.journal = Journal(self.workdir / "journal.db", clock=self.clock)
-        self.sinks = SinkStore(self.workdir / "sinks.db", clock=self.clock)
+        try:
+            self.sinks = SinkStore(self.workdir / "sinks.db", clock=self.clock)
+        except Exception:
+            # Do not leak open handles on the journal (Windows then refuses to delete it).
+            self.journal.close()
+            raise
         self.meter = ProviderMeter(self.sinks)
         self.tools = build_tool_registry(workspace=self.workdir / "workspace", sinks=self.sinks)
         self.workflows = WorkflowRegistry([program_definition()])

@@ -19,7 +19,7 @@ import time
 from dataclasses import asdict
 from pathlib import Path
 
-from replayable_agent_runtime.runtime.sigkill import SigkillResult, run_sigkill_seed
+from replayable_agent_runtime.runtime.sigkill import SigkillResult, run_seeds
 
 ROOT = Path(__file__).resolve().parents[1]
 RESULTS = ROOT / "bench" / "results" / "sigkill.json"
@@ -43,6 +43,7 @@ def summarize(results: list[SigkillResult]) -> dict[str, float]:
         "duplicate_paid_calls_inside_window_kills": float(
             sum(r.duplicate_provider_calls for r in window)
         ),
+        "harness_errors": float(sum(r.error is not None for r in results)),
         "passed": float(sum(r.passed for r in results)),
     }
 
@@ -55,13 +56,16 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     started = time.perf_counter()
-    results: list[SigkillResult] = []
-    with tempfile.TemporaryDirectory() as tmp:
-        for seed in range(args.start, args.start + args.seeds):
-            result = run_sigkill_seed(Path(tmp) / f"seed-{seed}", seed)
-            results.append(result)
-            if not result.passed:
-                print(f"FAILED seed {seed}: {result}")
+
+    def report(result: SigkillResult) -> None:
+        if not result.passed:
+            print(f"FAILED seed {result.seed}: {result}", flush=True)
+
+    # A seed that raises is recorded as a failure (run_seeds), and leftover files a killed worker
+    # still holds on Windows must not turn cleanup into a crash that hides the summary.
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+        seeds = range(args.start, args.start + args.seeds)
+        results = run_seeds(Path(tmp), seeds, report=report)
     summary = summarize(results)
     summary["seconds"] = round(time.perf_counter() - started, 1)
     for key, value in summary.items():
