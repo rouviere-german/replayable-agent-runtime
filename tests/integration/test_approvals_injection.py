@@ -173,6 +173,32 @@ def test_an_approval_edited_after_it_was_granted_halts_the_run_without_any_effec
     assert harness.sinks.ledger("research") == []
 
 
+def test_a_decision_forged_in_the_database_for_the_run_starter_halts_the_run(
+    harness: Harness,
+) -> None:
+    """The engine checks the decider against the chained starter, not only the decision row."""
+    harness.register("gate", gate)
+    harness.start("gate", run_id="forged")
+    asyncio.run(harness.worker().run_until_idle())
+    assert harness.journal.get_run("forged").status is RunStatus.WAITING
+    engine = make_engine(harness.journal.path)
+    with engine.begin() as conn:
+        conn.execute(
+            text(
+                "UPDATE approvals SET status = 'approved', decided_by = 'alice' "
+                "WHERE run_id = 'forged'"
+            )
+        )
+        conn.execute(text("UPDATE runs SET status = 'pending' WHERE run_id = 'forged'"))
+    engine.dispose()
+    asyncio.run(harness.worker().run_until_idle())
+    run = harness.journal.get_run("forged")
+    assert run.status is RunStatus.BLOCKED
+    assert run.blocked_reason is not None
+    assert "integrity" in run.blocked_reason
+    assert "ApprovalGranted" not in [r.type for r in harness.journal.load_history("forged")]
+
+
 async def direct_notify(ctx: WorkflowContext, value: JsonValue) -> JsonValue:
     await ctx.tool("notify", {"channel": "ops", "message": "hi"})
     return "sent"

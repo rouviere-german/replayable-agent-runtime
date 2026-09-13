@@ -3,7 +3,9 @@
 Database mutations run on a private copy (made with the SQLite backup API, so committed WAL
 content is included), each inside a transaction that is rolled back afterwards. Verification is the
 same check ``Journal.verify_run`` performs: the hash chain from seq 0 plus the head anchor in
-``runs``. Export mutations flip one byte at a time in a JSONL export.
+``runs``, then the ``runs`` and ``approvals`` columns the chain binds
+(:mod:`replayable_agent_runtime.runtime.bindings`). Export mutations flip one byte at a time in a
+JSONL export.
 
 Out of scope, by design: an attacker who rewrites the whole chain *and* the head anchor. That is
 detected only against an externally stored head (``--expect-head``); see docs/THREAT_MODEL.md.
@@ -11,13 +13,16 @@ detected only against an externally stored head (``--expect-head``); see docs/TH
 
 from __future__ import annotations
 
+import json
 import sqlite3
 import tempfile
-from collections.abc import Iterable
+from collections.abc import Iterable, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any
 
 from replayable_agent_runtime.agentic.audit import ChainRecord, verify_chain, verify_export
+from replayable_agent_runtime.runtime.bindings import ApprovalColumns, RunColumns, binding_error
 
 __all__ = ["TamperReport", "run_db_tamper_suite", "run_export_flip_suite"]
 
@@ -25,7 +30,45 @@ _SELECT_EVENTS = (
     "SELECT run_id, seq, command, type, fingerprint, payload, payload_sha256, recorded_at_us, "
     "prev_hash, hash FROM events WHERE run_id = ? ORDER BY seq"
 )
-_SELECT_HEAD = "SELECT head_seq, head_hash FROM runs WHERE run_id = ?"
+_SELECT_RUN = (
+    "SELECT head_seq, head_hash, workflow, input_json, started_by FROM runs WHERE run_id = ?"
+)
+_SELECT_APPROVALS = (
+    "SELECT approval_id, run_id, seq, command, subject_kind, name, args_json, call_hash, "
+    "requested_by, status, decided_by FROM approvals WHERE run_id = ? ORDER BY seq"
+)
+_RUN_UPDATES = {
+    "workflow": "UPDATE runs SET workflow = ? WHERE run_id = ?",
+    "input_json": "UPDATE runs SET input_json = ? WHERE run_id = ?",
+    "started_by": "UPDATE runs SET started_by = ? WHERE run_id = ?",
+}
+_RUN_COLUMN_INDEX = {"workflow": 2, "input_json": 3, "started_by": 4}
+_APPROVAL_UPDATES = {
+    "seq": "UPDATE approvals SET seq = ? WHERE approval_id = ?",
+    "command": "UPDATE approvals SET command = ? WHERE approval_id = ?",
+    "subject_kind": "UPDATE approvals SET subject_kind = ? WHERE approval_id = ?",
+    "name": "UPDATE approvals SET name = ? WHERE approval_id = ?",
+    "args_json": "UPDATE approvals SET args_json = ? WHERE approval_id = ?",
+    "call_hash": "UPDATE approvals SET call_hash = ? WHERE approval_id = ?",
+    "requested_by": "UPDATE approvals SET requested_by = ? WHERE approval_id = ?",
+}
+# Only bound once the decision itself is journaled (ApprovalGranted / ApprovalDenied).
+_DECISION_UPDATES = {
+    "status": "UPDATE approvals SET status = ? WHERE approval_id = ?",
+    "decided_by": "UPDATE approvals SET decided_by = ? WHERE approval_id = ?",
+}
+_APPROVAL_COLUMN_INDEX = {
+    "seq": 2,
+    "command": 3,
+    "subject_kind": 4,
+    "name": 5,
+    "args_json": 6,
+    "call_hash": 7,
+    "requested_by": 8,
+    "status": 9,
+    "decided_by": 10,
+}
+_DECISION_TYPES = frozenset({"ApprovalGranted", "ApprovalDenied"})
 # One static statement per column, so no SQL is ever built from strings.
 _UPDATES = {
     "command": "UPDATE events SET command = ? WHERE run_id = ? AND seq = ?",
@@ -84,10 +127,25 @@ def _flip_text(value: str) -> str:
 
 def _caught(conn: sqlite3.Connection, run_id: str) -> bool:
     rows = conn.execute(_SELECT_EVENTS, (run_id,)).fetchall()
-    head = conn.execute(_SELECT_HEAD, (run_id,)).fetchone()
+    run = conn.execute(_SELECT_RUN, (run_id,)).fetchone()
     records = [ChainRecord(*row) for row in rows]
-    expect = (int(head[0]), str(head[1])) if head is not None else (-1, "")
-    return not verify_chain(records, run_id=run_id, expect_head=expect).ok
+    if run is None:
+        return not verify_chain(records, run_id=run_id, expect_head=(-1, "")).ok
+    if not verify_chain(records, run_id=run_id, expect_head=(int(run[0]), str(run[1]))).ok:
+        return True
+    approvals = [
+        ApprovalColumns(*row) for row in conn.execute(_SELECT_APPROVALS, (run_id,)).fetchall()
+    ]
+    columns = RunColumns(str(run[2]), str(run[3]), str(run[4]))
+    return binding_error(records, columns, approvals) is not None
+
+
+def _decided_approvals(rows: Sequence[Sequence[Any]]) -> set[str]:
+    decided: set[str] = set()
+    for row in rows:
+        if row[3] in _DECISION_TYPES:
+            decided.add(str(json.loads(row[5])["approval_id"]))
+    return decided
 
 
 def _attempt(
@@ -163,6 +221,25 @@ def run_db_tamper_suite(db_path: Path, run_id: str) -> TamperReport:
                 conn, report, run_id, "forge_append", str(head_seq + 1),
                 [("INSERT INTO events VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", forged)],
             )  # fmt: skip
+            run = conn.execute(_SELECT_RUN, (run_id,)).fetchone()
+            for column, sql in _RUN_UPDATES.items():
+                mutated_text = _flip_text(str(run[_RUN_COLUMN_INDEX[column]]))
+                _attempt(
+                    conn, report, run_id, "modify_run_row", column,
+                    [(sql, (mutated_text, run_id))],
+                )  # fmt: skip
+            decided = _decided_approvals(rows)
+            for approval in conn.execute(_SELECT_APPROVALS, (run_id,)).fetchall():
+                updates = dict(_APPROVAL_UPDATES)
+                if approval[0] in decided:
+                    updates.update(_DECISION_UPDATES)
+                for column, sql in updates.items():
+                    value = approval[_APPROVAL_COLUMN_INDEX[column]]
+                    changed = value + 1 if isinstance(value, int) else _flip_text(str(value))
+                    _attempt(
+                        conn, report, run_id, "modify_approval_row", f"{approval[0]}.{column}",
+                        [(sql, (changed, approval[0]))],
+                    )  # fmt: skip
         finally:
             conn.close()
     return report

@@ -57,8 +57,57 @@ def test_every_modification_deletion_reordering_truncation_and_forgery_is_detect
         "reorder": events - 1,
         "truncate_tail": 3,
         "forge_append": 1,
+        # Columns outside the events table that the chain binds: the runs row (workflow, input,
+        # starter) and every column of the decided approval row.
+        "modify_run_row": 3,
+        "modify_approval_row": 9,
     }
     assert harness.journal.verify_run(run_id).ok
+
+
+async def echo_after_sleep(ctx: WorkflowContext, value: JsonValue) -> JsonValue:
+    await ctx.sleep(10)
+    return {"echo": value, "started_by": ctx.started_by}
+
+
+_RUN_COLUMN_EDITS = {
+    "input_json": "UPDATE runs SET input_json = :v WHERE run_id = :r",
+    "workflow": "UPDATE runs SET workflow = :v WHERE run_id = :r",
+    "started_by": "UPDATE runs SET started_by = :v WHERE run_id = :r",
+}
+
+
+@pytest.mark.parametrize(
+    ("column", "value"),
+    [("input_json", '{"amount":1000000}'), ("workflow", "other"), ("started_by", "mallory")],
+)
+def test_run_columns_outside_the_chain_are_verified_and_never_executed(
+    harness: Harness, column: str, value: str
+) -> None:
+    """Regression: the engine ran on runs.input_json and verify_run ignored the runs row."""
+    import asyncio
+
+    harness.register("echo", echo_after_sleep)
+    harness.register("other", echo_after_sleep)
+    run_id = harness.start("echo", {"amount": 1})
+    assert asyncio.run(harness.worker().run_once(run_id=run_id)) is not None
+    engine = make_engine(harness.journal.path)
+    with engine.begin() as conn:
+        conn.execute(text(_RUN_COLUMN_EDITS[column]), {"v": value, "r": run_id})
+    engine.dispose()
+    result = harness.journal.verify_run(run_id)
+    assert not result.ok
+    assert result.error is not None
+    assert "RunStarted" in result.error
+    harness.clock.advance(20)
+    harness.journal.wake_due()
+    asyncio.run(harness.worker().run_once(run_id=run_id))
+    run = harness.journal.get_run(run_id)
+    assert run.status is RunStatus.BLOCKED
+    assert run.blocked_reason is not None
+    assert "integrity" in run.blocked_reason
+    assert run.result is None
+    assert [r.type for r in harness.journal.load_history(run_id)][-1] == "TimerScheduled"
 
 
 def test_single_byte_flips_anywhere_in_an_export_are_detected(harness: Harness) -> None:

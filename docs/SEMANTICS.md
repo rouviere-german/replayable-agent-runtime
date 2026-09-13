@@ -132,6 +132,14 @@ append latency (see BENCHMARKS.md). See docs/adr/0003-sqlite-wal-synchronous-nor
 
 Every event commits to its payload digest and to its predecessor's hash; `runs.head_seq` and
 `runs.head_hash` anchor the tail. An activation verifies the chain before replaying and blocks a run
-whose chain does not verify. Someone with write access to the database file can rebuild a
+whose chain does not verify.
+
+Some facts are repeated in mutable columns for querying: the `runs` row repeats `RunStarted`'s
+workflow, input and starter, and each `approvals` row repeats its `ApprovalRequested` event (and,
+once journaled, its decision). The engine executes the workflow with the input and starter from the
+verified `RunStarted` event and blocks a run whose `runs` row disagrees. An approval decision
+verifies the run's whole chain, checks both rows against their events and applies separation of
+duties to the chained starter. `rar audit verify` reports any mismatch between these columns and the
+chain. Someone with write access to the database file can rebuild a
 consistent chain *and* head; that is detected only against a head hash stored elsewhere
 (`rar audit verify --expect-head`, or an exported copy).

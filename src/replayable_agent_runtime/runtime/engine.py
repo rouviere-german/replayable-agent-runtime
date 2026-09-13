@@ -16,6 +16,7 @@ from replayable_agent_runtime.agentic.tools import ToolRegistry
 from replayable_agent_runtime.core.canonical import CanonicalJSONError, canonical_json
 from replayable_agent_runtime.core.logging import get_logger
 from replayable_agent_runtime.core.redaction import redact_text
+from replayable_agent_runtime.runtime.bindings import RunColumns, run_binding_error
 from replayable_agent_runtime.runtime.context import ActivationState, WorkflowContext
 from replayable_agent_runtime.runtime.db import Clock
 from replayable_agent_runtime.runtime.errors import (
@@ -94,10 +95,15 @@ async def activate(runtime: Runtime, claim: Claim) -> ActivationOutcome:
             return _block(
                 runtime, claim, f"journal integrity: {verified.error} (seq {verified.seq})"
             )
+        # The workflow, input and starter the run executes with come from the verified RunStarted
+        # event; a runs row that disagrees with it was edited outside the chain.
+        bound = run_binding_error(history, RunColumns(run.workflow, run.input_json, run.started_by))
+        if bound is not None:
+            return _block(runtime, claim, f"journal integrity: {bound.message}")
         if any(record.type in TERMINAL_EVENTS for record in history):
             return _block(runtime, claim, "run has a terminal event but is not closed")
         try:
-            definition = runtime.workflows.get(run.workflow)
+            definition = runtime.workflows.get(str(history[0].data()["workflow"]))
         except UnknownWorkflowError as exc:
             return _block(runtime, claim, str(exc))
         state = ActivationState(runtime, claim, history, definition)
@@ -117,7 +123,7 @@ async def _drive(
 
     try:
         try:
-            result = await state.definition.fn(ctx, claim.run.input)
+            result = await state.definition.fn(ctx, state.workflow_input)
         except WorkflowCancelled:
             # Divergence is checked before compensating, so a bad deploy blocks in-flight runs
             # instead of failing them and rolling back their effects.
@@ -197,7 +203,7 @@ async def replay_check(runtime: Runtime, run_id: str) -> ActivationOutcome:
     journal = runtime.journal
     run = journal.get_run(run_id)
     history = journal.load_history(run_id)
-    definition = runtime.workflows.get(run.workflow)
+    definition = runtime.workflows.get(str(history[0].data()["workflow"]))
     claim = Claim(
         lease=Lease(run_id=run_id, owner="replay-check", fencing=-1), run=run, reclaimed=False
     )
@@ -205,7 +211,7 @@ async def replay_check(runtime: Runtime, run_id: str) -> ActivationOutcome:
     ctx = WorkflowContext(state)
     try:
         try:
-            await definition.fn(ctx, run.input)
+            await definition.fn(ctx, state.workflow_input)
         except (WorkflowCancelled, Exception) as exc:  # noqa: BLE001 - recorded failures replay too
             # The engine compensated after this failure; replay those commands too.
             ctx.ensure_only_compensations_remain()

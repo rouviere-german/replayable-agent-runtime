@@ -311,6 +311,48 @@ def test_an_edited_approval_row_cannot_be_approved(journal: Journal) -> None:
     engine.dispose()
 
 
+def test_separation_of_duties_uses_the_chained_starter_and_request(journal: Journal) -> None:
+    """Regression: SoD read runs.started_by and approvals.requested_by, neither in the chain."""
+    started(journal)
+    claim = journal.claim("w1", 5)
+    assert claim is not None
+    call_hash = _request_gate(journal, claim.lease, {"env": "prod"})
+    engine = make_engine(journal.path)
+    with engine.begin() as conn:
+        conn.exec_driver_sql("UPDATE runs SET started_by = 'mallory'")
+        conn.exec_driver_sql("UPDATE approvals SET requested_by = 'mallory'")
+    engine.dispose()
+    with pytest.raises(ApprovalError):
+        journal.decide_approval("run-1:0", approver="alice", approve=True, presented_hash=call_hash)
+    assert journal.get_approval("run-1:0").status.value == "pending"
+    result = journal.verify_run("run-1")
+    assert not result.ok
+    assert result.error is not None
+    assert "RunStarted" in result.error
+
+
+def test_verify_run_checks_approval_rows_against_their_chained_requests(journal: Journal) -> None:
+    started(journal)
+    claim = journal.claim("w1", 5)
+    assert claim is not None
+    _request_gate(journal, claim.lease, {"env": "prod"})
+    assert journal.verify_run("run-1").ok
+    engine = make_engine(journal.path)
+    with engine.begin() as conn:
+        conn.exec_driver_sql("UPDATE approvals SET requested_by = 'mallory'")
+    result = journal.verify_run("run-1")
+    assert not result.ok
+    assert result.error is not None
+    assert "approval run-1:0" in result.error
+    with engine.begin() as conn:
+        conn.exec_driver_sql("DELETE FROM approvals")
+    engine.dispose()
+    missing = journal.verify_run("run-1")
+    assert not missing.ok
+    assert missing.error is not None
+    assert "no approval row" in missing.error
+
+
 @settings(max_examples=25)
 @given(st.lists(st.sampled_from(["claim", "expire", "append"]), min_size=1, max_size=25))
 def test_fencing_tokens_strictly_increase_and_only_the_latest_lease_appends(

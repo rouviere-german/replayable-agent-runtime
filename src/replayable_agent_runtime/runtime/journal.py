@@ -50,6 +50,7 @@ from replayable_agent_runtime.agentic.audit import (
 from replayable_agent_runtime.agentic.budget import BudgetLimits
 from replayable_agent_runtime.agentic.errors import ApprovalError, ApprovalIntegrityError
 from replayable_agent_runtime.core.canonical import canonical_json
+from replayable_agent_runtime.runtime.bindings import ApprovalColumns, RunColumns, binding_error
 from replayable_agent_runtime.runtime.db import Clock, SynchronousMode, make_engine, now_us
 from replayable_agent_runtime.runtime.errors import (
     FencedOutError,
@@ -123,6 +124,7 @@ class RunRow:
     workflow: str
     status: RunStatus
     input: JsonValue
+    input_json: str
     started_by: str
     created_at_us: int
     updated_at_us: int
@@ -188,6 +190,7 @@ def _run_from_row(row: Row[Any]) -> RunRow:
         workflow=row.workflow,
         status=RunStatus(row.status),
         input=json.loads(row.input_json),
+        input_json=row.input_json,
         started_by=row.started_by,
         created_at_us=row.created_at_us,
         updated_at_us=row.updated_at_us,
@@ -235,6 +238,26 @@ def _approval_from_row(row: Row[Any]) -> ApprovalRequest:
         status=ApprovalStatus(row.status),
         decided_by=row.decided_by,
         reason=row.reason,
+    )
+
+
+def _run_columns(row: Row[Any]) -> RunColumns:
+    return RunColumns(workflow=row.workflow, input_json=row.input_json, started_by=row.started_by)
+
+
+def _approval_columns(row: Row[Any]) -> ApprovalColumns:
+    return ApprovalColumns(
+        approval_id=row.approval_id,
+        run_id=row.run_id,
+        seq=row.seq,
+        command=row.command,
+        subject_kind=row.subject_kind,
+        name=row.name,
+        args_json=row.args_json,
+        call_hash=row.call_hash,
+        requested_by=row.requested_by,
+        status=row.status,
+        decided_by=row.decided_by,
     )
 
 
@@ -422,10 +445,19 @@ class Journal:
 
     def load_history(self, run_id: str) -> list[EventRecord]:
         with self._reader.connect() as conn:
-            rows = conn.execute(
-                select(events).where(events.c.run_id == run_id).order_by(events.c.seq)
-            )
-            return [_event_from_row(row) for row in rows]
+            return self._history(conn, run_id)
+
+    @staticmethod
+    def _history(conn: Connection, run_id: str) -> list[EventRecord]:
+        rows = conn.execute(select(events).where(events.c.run_id == run_id).order_by(events.c.seq))
+        return [_event_from_row(row) for row in rows]
+
+    @staticmethod
+    def _approval_rows(conn: Connection, run_id: str) -> list[ApprovalColumns]:
+        rows = conn.execute(
+            select(approvals).where(approvals.c.run_id == run_id).order_by(approvals.c.seq)
+        )
+        return [_approval_columns(row) for row in rows]
 
     # ------------------------------------------------------------------ leases
 
@@ -825,24 +857,6 @@ class Journal:
         with self._reader.connect() as conn:
             return [_approval_from_row(row) for row in conn.execute(query)]
 
-    def journaled_call_hash(self, conn: Connection, run_id: str, seq: int) -> str:
-        """The call hash of the hash-verified ``ApprovalRequested`` event at ``seq``."""
-        row = conn.execute(
-            select(events).where(events.c.run_id == run_id, events.c.seq == seq)
-        ).first()
-        if row is None or row.type != EventType.APPROVAL_REQUESTED.value:
-            raise ApprovalIntegrityError(f"no journaled approval request at {run_id}:{seq}")
-        record = _event_from_row(row)
-        if (
-            payload_digest(record.payload) != record.payload_sha256
-            or record.computed_hash() != record.hash
-        ):
-            raise ApprovalIntegrityError(f"journaled approval request at {run_id}:{seq} tampered")
-        call_hash = record.data().get("call_hash")
-        if not isinstance(call_hash, str):
-            raise ApprovalIntegrityError(f"journaled approval request at {run_id}:{seq} malformed")
-        return call_hash
-
     def decide_approval(
         self,
         approval_id: str,
@@ -852,6 +866,12 @@ class Journal:
         presented_hash: str,
         reason: str | None = None,
     ) -> ApprovalRequest:
+        """Record a decision after checking it against the verified chain, not mutable columns.
+
+        Inside the write transaction the run's whole chain is verified against its head, the
+        ``runs`` and ``approvals`` rows are checked against ``RunStarted`` and the
+        ``ApprovalRequested`` events, and separation of duties uses the chained starter.
+        """
         now = self.now_us()
         with self._writer.begin() as conn:
             row = conn.execute(
@@ -860,22 +880,34 @@ class Journal:
             if row is None:
                 raise ApprovalError(f"unknown approval {approval_id}")
             request = _approval_from_row(row)
-            run = conn.execute(
-                select(runs.c.status, runs.c.started_by).where(runs.c.run_id == request.run_id)
-            ).first()
+            run = conn.execute(select(runs).where(runs.c.run_id == request.run_id)).first()
             if run is None:
                 raise RunNotFoundError(request.run_id)
             if RunStatus(run.status) in TERMINAL_STATUSES:
                 raise ApprovalError(f"run {request.run_id} is {run.status}")
-            if approver == run.started_by:
+            history = self._history(conn, request.run_id)
+            chain = verify_chain(
+                history, run_id=request.run_id, expect_head=(run.head_seq, run.head_hash)
+            )
+            if not chain.ok:
+                raise ApprovalIntegrityError(
+                    f"journal of run {request.run_id} does not verify: {chain.error}"
+                )
+            bound = binding_error(
+                history, _run_columns(run), self._approval_rows(conn, request.run_id)
+            )
+            if bound is not None:
+                raise ApprovalIntegrityError(f"run {request.run_id}: {bound.message}")
+            if approver == str(history[0].data()["started_by"]):
                 raise ApprovalError(
                     "separation of duties: the run starter cannot approve its own run"
                 )
+            requested = next(record for record in history if record.seq == request.seq)
             check_decision(
                 request,
                 approver=approver,
                 presented_hash=presented_hash,
-                journal_call_hash=self.journaled_call_hash(conn, request.run_id, request.seq),
+                journal_call_hash=str(requested.data()["call_hash"]),
             )
             status = ApprovalStatus.APPROVED if approve else ApprovalStatus.DENIED
             conn.execute(
@@ -974,11 +1006,21 @@ class Journal:
     # ------------------------------------------------------------------ verification and export
 
     def verify_run(self, run_id: str, *, expect_head: str | None = None) -> VerifyResult:
-        run = self.get_run(run_id)
-        result = verify_chain(
-            self.load_history(run_id), run_id=run_id, expect_head=(run.head_seq, run.head_hash)
-        )
-        if result.ok and expect_head is not None and expect_head != result.head:
+        """Verify the chain against the stored head, then the ``runs`` and ``approvals`` columns
+        the chain binds (see :mod:`replayable_agent_runtime.runtime.bindings`)."""
+        with self._reader.connect() as conn:
+            run = conn.execute(select(runs).where(runs.c.run_id == run_id)).first()
+            if run is None:
+                raise RunNotFoundError(run_id)
+            history = self._history(conn, run_id)
+            approval_rows = self._approval_rows(conn, run_id)
+        result = verify_chain(history, run_id=run_id, expect_head=(run.head_seq, run.head_hash))
+        if not result.ok:
+            return result
+        bound = binding_error(history, _run_columns(run), approval_rows)
+        if bound is not None:
+            return VerifyResult(False, result.entries, result.head, bound.message, bound.seq)
+        if expect_head is not None and expect_head != result.head:
             return VerifyResult(
                 False, result.entries, result.head, "head mismatch with the external anchor"
             )

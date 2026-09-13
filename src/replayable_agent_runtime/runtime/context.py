@@ -178,6 +178,9 @@ class ActivationState:
                 self.commands.setdefault(record.command, []).append(record)
         self.recorded_commands = max(self.commands) + 1 if self.commands else 0
         started = history[0].data()
+        # Input and starter come from the hash-chained RunStarted event, never the runs row.
+        self.workflow_input: JsonValue = started["input"]
+        self.started_by = str(started["started_by"])
         limits = limits_from_payload(started["budget"])
         if runtime.budget_cap is not None:
             limits = limits.tightest(runtime.budget_cap)
@@ -223,7 +226,7 @@ class WorkflowContext:
 
     @property
     def started_by(self) -> str:
-        return self._state.run.started_by
+        return self._state.started_by
 
     @property
     def is_replaying(self) -> bool:
@@ -790,7 +793,7 @@ class WorkflowContext:
                 name=name,
                 args=args,
                 call_hash=call_hash,
-                requested_by=state.run.started_by,
+                requested_by=state.started_by,
             )
             state.add(command, [record])
             raise WorkflowSuspended(
@@ -821,6 +824,15 @@ class WorkflowContext:
             raise IntegrityHalt(str(exc)) from exc
         if approval.call_hash != call_hash:
             raise IntegrityHalt(f"approval {approval.approval_id} is bound to a different call")
+        if approval.requested_by != requested_data.get("requested_by"):
+            raise IntegrityHalt(
+                f"approval {approval.approval_id} differs from its journaled request"
+            )
+        if not approval.decided_by or approval.decided_by == state.started_by:
+            raise IntegrityHalt(
+                f"approval {approval.approval_id} was not decided by a principal other than "
+                "the run starter"
+            )
         granted = approval.status is ApprovalStatus.APPROVED
         self._append(
             command,
