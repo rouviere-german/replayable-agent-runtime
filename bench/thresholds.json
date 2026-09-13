@@ -1,0 +1,9 @@
+{
+  "journal_append_normal": {"p95_ms": 10.0},
+  "resume_1k_events": {"p95_ms": 150.0},
+  "replay_to_head_1001_events": {"p95_ms": 150.0},
+  "verify_chain_1k_events": {"p95_ms": 60.0},
+  "llm_request_sha256_10_messages": {"p95_ms": 2.0},
+  "redact_text_1kb": {"p95_ms": 3.0},
+  "rate_limiter_check": {"p95_ms": 0.05}
+}
