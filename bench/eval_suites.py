@@ -9,7 +9,9 @@ Usage:
   kind; the recovered run must match an uncrashed run of the same program;
 - provider accounting: paid provider calls repeated for the same step after recovery;
 - zombie worker: stale-token writes rejected with fencing, and duplicated in the control;
-- mutation suite: 20 nondeterministic edits raise NonDeterminismError, patched edits do not;
+- mutation suite: 22 nondeterministic edits (including edits that raise or return early) raise
+  NonDeterminismError on strict replay and block an in-flight run through the live engine; patched
+  edits replay cleanly and finish the in-flight run;
 - tamper suite: modifications, deletions, reorderings, truncations and forged appends in the
   database, and every single-byte flip of a full export.
 
@@ -135,8 +137,14 @@ def mutations() -> dict[str, float]:
     return {
         "nondeterministic_edits": float(len(mutants)),
         "nondeterministic_edits_detected": float(sum(r.raised for r in mutants)),
+        "nondeterministic_edits_blocked_in_flight": float(
+            sum(r.in_flight_outcome == "blocked" and r.in_flight_appended == 0 for r in mutants)
+        ),
         "patched_edits": float(len(patched)),
         "patched_edits_replayed_cleanly": float(sum(not r.raised for r in patched)),
+        "patched_edits_completed_in_flight": float(
+            sum(r.in_flight_outcome == "completed" for r in patched)
+        ),
     }
 
 
@@ -185,12 +193,17 @@ def gates(report: dict[str, dict[str, float]]) -> list[str]:
         "the control (fencing off) shows duplicates": (
             zombies["control_notifier_duplicate_applications"] >= zombies["trials_per_mode"]
         ),
-        "all 20 nondeterministic edits are detected": (
-            mutation["nondeterministic_edits"] == 20
-            and mutation["nondeterministic_edits_detected"] == 20
+        "at least 20 nondeterministic edits, all detected by strict replay": (
+            mutation["nondeterministic_edits"] >= 20
+            and mutation["nondeterministic_edits_detected"] == mutation["nondeterministic_edits"]
         ),
-        "patched edits replay cleanly": (
+        "every nondeterministic edit blocks an in-flight run without appending": (
+            mutation["nondeterministic_edits_blocked_in_flight"]
+            == mutation["nondeterministic_edits"]
+        ),
+        "patched edits replay cleanly and finish in-flight runs": (
             mutation["patched_edits_replayed_cleanly"] == mutation["patched_edits"]
+            and mutation["patched_edits_completed_in_flight"] == mutation["patched_edits"]
         ),
         "every tampering is detected": tampering["detection_rate"] == 1.0,
     }

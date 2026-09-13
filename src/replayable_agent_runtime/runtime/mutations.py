@@ -1,9 +1,18 @@
-"""Determinism suite: 20 nondeterministic edits of a workflow, and edits guarded by ``patched``.
+"""Determinism suite: 22 nondeterministic edits of a workflow, and edits guarded by ``patched``.
 
 A base workflow is run to completion (model calls, a read tool, a durable timer, a signal, a human
-gate and an approved write). Each edit then strictly replays that recorded history with
-:func:`~replayable_agent_runtime.runtime.engine.replay_check`. Every unguarded edit must raise
-``NonDeterminismError``; every edit guarded by ``ctx.patched`` must replay the old history cleanly.
+gate and an approved write). Each edit is then checked on two paths:
+
+- **strict replay** of the completed history with
+  :func:`~replayable_agent_runtime.runtime.engine.replay_check`;
+- **the live engine**: a second run of the base workflow is parked in flight (every step recorded,
+  the worker killed just before ``RunCompleted`` commits) and activated with the edited code through
+  :func:`~replayable_agent_runtime.runtime.engine.activate`.
+
+Every unguarded edit, including edits that raise or return early before the history head, must
+raise ``NonDeterminismError`` on replay and leave the in-flight run blocked with nothing appended.
+Every edit guarded by ``ctx.patched`` must replay the old history cleanly and finish the in-flight
+run.
 
 Workflows are written as step lists so each edit is one visible, reviewable change.
 """
@@ -19,9 +28,14 @@ from pydantic import JsonValue
 
 from replayable_agent_runtime.agentic.providers.base import ChatMessage, LLMRequest
 from replayable_agent_runtime.agentic.providers.fake import FakeProvider
-from replayable_agent_runtime.runtime.chaos import ChaosEnvironment, echo_policy
+from replayable_agent_runtime.runtime.chaos import (
+    ChaosEnvironment,
+    CrashInjector,
+    CrashPoint,
+    echo_policy,
+)
 from replayable_agent_runtime.runtime.context import WorkflowContext
-from replayable_agent_runtime.runtime.engine import Runtime, replay_check
+from replayable_agent_runtime.runtime.engine import Runtime, activate, replay_check
 from replayable_agent_runtime.runtime.errors import NonDeterminismError
 from replayable_agent_runtime.runtime.journal import RunStatus
 from replayable_agent_runtime.runtime.workflows import (
@@ -83,6 +97,22 @@ def patched(patch_id: str, then: Sequence[Step], otherwise: Sequence[Step]) -> S
     return Step("patched", patch_id, then=tuple(then), otherwise=tuple(otherwise))
 
 
+def fail(message: str) -> Step:
+    """Workflow code raises (for example a validation added in a new version)."""
+    return Step("raise", "", {"message": message})
+
+
+def return_early(**value: JsonValue) -> Step:
+    """Workflow code returns an error value instead of continuing."""
+    return Step("return", "", value)
+
+
+class _EarlyReturn(Exception):  # noqa: N818 - control flow inside the scripted workflow only
+    def __init__(self, value: dict[str, JsonValue]) -> None:
+        super().__init__("early return")
+        self.value = value
+
+
 async def _run_steps(ctx: WorkflowContext, steps: Sequence[Step], outputs: list[JsonValue]) -> None:
     for step in steps:
         if step.kind == "now":
@@ -114,6 +144,10 @@ async def _run_steps(ctx: WorkflowContext, steps: Sequence[Step], outputs: list[
         elif step.kind == "patched":
             branch = step.then if ctx.patched(step.name) else step.otherwise
             await _run_steps(ctx, branch, outputs)
+        elif step.kind == "raise":
+            raise ValueError(str(step.args["message"]))
+        elif step.kind == "return":
+            raise _EarlyReturn(dict(step.args))
         else:
             raise ValueError(f"unknown step kind {step.kind}")
 
@@ -122,7 +156,10 @@ def scripted(steps: Sequence[Step]) -> WorkflowFn:
     async def workflow(ctx: WorkflowContext, value: JsonValue) -> JsonValue:
         del value
         outputs: list[JsonValue] = []
-        await _run_steps(ctx, steps, outputs)
+        try:
+            await _run_steps(ctx, steps, outputs)
+        except _EarlyReturn as early:
+            return early.value
         return {"outputs": outputs}
 
     return workflow
@@ -177,6 +214,8 @@ MUTANTS: tuple[tuple[str, tuple[Step, ...]], ...] = (
         _replace(7, tool("create_ticket", title="incident-2", body="see summary")),
     ),
     ("model_call_replaced_by_tool", _replace(8, tool("kb_lookup", key="follow-up"))),
+    ("raises_before_the_head", _insert(4, fail("validation added in v2"))),
+    ("returns_an_error_value_early", _insert(6, return_early(error="deploy gate skipped"))),
 )
 
 PATCHED: tuple[tuple[str, tuple[Step, ...]], ...] = (
@@ -209,14 +248,33 @@ class MutationResult:
     expected_nondeterminism: bool
     raised: bool
     detail: str
+    in_flight_outcome: str = ""
+    in_flight_detail: str | None = None
+    in_flight_appended: int = 0
 
     @property
     def as_expected(self) -> bool:
-        return self.raised == self.expected_nondeterminism
+        if self.raised != self.expected_nondeterminism:
+            return False
+        if self.expected_nondeterminism:
+            return self.in_flight_outcome == "blocked" and self.in_flight_appended == 0
+        return self.in_flight_outcome == "completed"
+
+
+def _park_in_flight(env: ChaosEnvironment, run_id: str, completion_seq: int) -> None:
+    """Run the base workflow and kill the worker just before ``RunCompleted`` commits."""
+    env.control.start_run(
+        workflow=WORKFLOW, input_value=None, principal="chaos-starter", run_id=run_id
+    )
+    injector = CrashInjector([CrashPoint("before_commit", completion_seq)])
+    env.drive(run_id, injector, stop_after_crash=True)
+    run = env.journal.get_run(run_id)
+    if run.status is not RunStatus.RUNNING or run.head_seq != completion_seq - 1:
+        raise RuntimeError(f"could not park {run_id} before its completion")
 
 
 def evaluate_mutations(workdir: Path) -> list[MutationResult]:
-    """Record the base history once, then strictly replay it through every edit."""
+    """Record the base history once; check every edit by strict replay and on an in-flight run."""
     env = ChaosEnvironment(workdir)
     try:
         env.workflows.register(WorkflowDefinition(WORKFLOW, scripted(BASE), TOOLS))
@@ -224,12 +282,15 @@ def evaluate_mutations(workdir: Path) -> list[MutationResult]:
             workflow=WORKFLOW, input_value=None, principal="chaos-starter", run_id="base-run"
         )
         env.drive("base-run")
-        if env.journal.get_run("base-run").status is not RunStatus.COMPLETED:
+        base = env.journal.get_run("base-run")
+        if base.status is not RunStatus.COMPLETED:
             raise RuntimeError("the base workflow did not complete")
+        completion_seq = base.head_seq
         results: list[MutationResult] = []
         cases = [(name, steps, True) for name, steps in MUTANTS]
         cases += [(name, steps, False) for name, steps in PATCHED]
-        for name, steps, expected in cases:
+        in_flight: str | None = None
+        for index, (name, steps, expected) in enumerate(cases):
             runtime = Runtime(
                 journal=env.journal,
                 workflows=WorkflowRegistry([WorkflowDefinition(WORKFLOW, scripted(steps), TOOLS)]),
@@ -240,9 +301,35 @@ def evaluate_mutations(workdir: Path) -> list[MutationResult]:
             try:
                 outcome = asyncio.run(replay_check(runtime, "base-run"))
             except NonDeterminismError as exc:
-                results.append(MutationResult(name, expected, True, str(exc)))
+                raised, detail = True, str(exc)
             else:
-                results.append(MutationResult(name, expected, False, outcome.outcome))
+                raised, detail = False, outcome.outcome
+
+            if in_flight is None:
+                in_flight = f"in-flight-{index}"
+                _park_in_flight(env, in_flight, completion_seq)
+            env.clock.advance(env.lease_seconds + 1)
+            claim = env.journal.claim("mutation-check", env.lease_seconds, run_id=in_flight)
+            if claim is None:
+                raise RuntimeError(f"could not claim {in_flight}")
+            activation = asyncio.run(activate(runtime, claim))
+            after = env.journal.get_run(in_flight)
+            appended = after.head_seq - claim.run.head_seq
+            if after.status is RunStatus.BLOCKED:
+                env.journal.retry_blocked(in_flight)  # reusable: nothing was appended
+            else:
+                in_flight = None
+            results.append(
+                MutationResult(
+                    name,
+                    expected,
+                    raised,
+                    detail,
+                    in_flight_outcome=activation.outcome,
+                    in_flight_detail=activation.detail,
+                    in_flight_appended=appended,
+                )
+            )
         return results
     finally:
         env.close()

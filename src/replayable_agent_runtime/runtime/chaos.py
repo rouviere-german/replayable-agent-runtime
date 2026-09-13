@@ -392,9 +392,17 @@ class ChaosEnvironment:
         return False
 
     def drive(
-        self, run_id: str, injector: CrashInjector | None = None, *, max_activations: int = 400
+        self,
+        run_id: str,
+        injector: CrashInjector | None = None,
+        *,
+        max_activations: int = 400,
+        stop_after_crash: bool = False,
     ) -> tuple[int, int]:
-        """Activate the run until it is terminal or blocked. Returns (activations, crashes)."""
+        """Activate the run until it is terminal or blocked. Returns (activations, crashes).
+
+        ``stop_after_crash`` leaves the run exactly as the crash left it (lease still held).
+        """
         hooks = injector or CrashInjector(())
         self.journal.append_hooks[:] = [hooks.append_hook]
         activations = crashes = resolved = 0
@@ -421,6 +429,8 @@ class ChaosEnvironment:
                     outcome = asyncio.run(worker.run_once(run_id=run_id))
                 except SimulatedCrash:
                     crashes += 1
+                    if stop_after_crash:
+                        break
                     self.clock.advance(self.lease_seconds + 1)
                     continue
                 if outcome is None:
