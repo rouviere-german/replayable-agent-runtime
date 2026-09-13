@@ -225,6 +225,43 @@ def test_the_file_jail_refuses_paths_that_leave_the_workspace(tmp_path: Path, pa
     assert path not in str(info.value) or not path
 
 
+@pytest.mark.parametrize(
+    "path",
+    [
+        "CON",
+        "nul",
+        "aux.txt",
+        "COM1",
+        "com0.log",
+        "lpt1.txt",
+        "notes/PRN",
+        "notes/Nul.md",
+        "CONIN$",
+        "conout$.txt",
+        "COM¹",
+        "LPT³.txt",
+        "con .txt",
+        "secret.txt.",
+        "notes./today.md",
+        "trailing ",
+        "...",
+    ],
+)
+def test_the_file_jail_refuses_windows_device_names_and_trailing_dots_or_spaces(
+    tmp_path: Path, path: str
+) -> None:
+    """Regression: device names and trailing dots or spaces resolved to workspace paths."""
+    jail = WorkspaceJail(tmp_path / "ws")
+    with pytest.raises(ToolPolicyError, match=r"reserved|trailing"):
+        jail.resolve(path)
+
+
+def test_names_that_only_resemble_device_names_are_allowed(tmp_path: Path) -> None:
+    jail = WorkspaceJail(tmp_path / "ws")
+    for path in ("console.txt", "com10.txt", "notes/lpt.md", "auxiliary/nulls.csv", ".env.d"):
+        assert jail.resolve(path).is_relative_to(jail.root)
+
+
 def test_the_file_jail_resolves_relative_paths_inside(tmp_path: Path) -> None:
     jail = WorkspaceJail(tmp_path / "ws")
     target = jail.resolve("notes/today.md")

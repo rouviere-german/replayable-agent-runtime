@@ -41,6 +41,12 @@ ServiceHandler = Callable[[str, Mapping[str, list[str]]], tuple[int, str]]
 _MAX_FILE_BYTES = 64_000
 _MAX_BODY_CHARS = 16_000
 _HOST = re.compile(r"^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)*$")
+# Windows device names, reserved in every directory and with any extension ("NUL.txt"); the
+# superscript digits are reserved too. Matched against a component's part before its first dot.
+_RESERVED_DEVICE = re.compile(
+    r"^(con|prn|aux|nul|com[0-9¹²³]|lpt[0-9¹²³]|conin\$|conout\$)$",
+    re.IGNORECASE,
+)
 
 INJECTED_ARTICLE = (
     "Incident 42 postmortem: the cache tier ran out of memory after a config push.\n"
@@ -61,9 +67,12 @@ class _Args(BaseModel):
 class WorkspaceJail:
     """Resolve model-supplied relative paths strictly inside one workspace directory.
 
-    Lexical checks reject absolute paths, drive letters, UNC paths, ``..`` components, NUL bytes
-    and alternate data streams; the ``realpath`` check then refuses anything (for example a
-    symlink) that resolves outside the workspace.
+    Lexical checks reject absolute paths, drive letters, UNC paths, ``..`` components, NUL bytes,
+    alternate data streams, Windows device names (``CON``, ``NUL.txt``, ``COM1``...) and components
+    ending in a dot or space (which Windows silently strips, so ``secret.txt.`` would alias
+    ``secret.txt``); the ``realpath`` check then refuses anything (for example a symlink) that
+    resolves outside the workspace. The checks apply on every platform, so a workspace behaves the
+    same wherever it is mounted.
     """
 
     def __init__(self, root: Path) -> None:
@@ -80,6 +89,11 @@ class WorkspaceJail:
         raw_parts = text.replace("\\", "/").split("/")
         if any(part in {"..", "."} for part in raw_parts) or PurePosixPath(text).is_absolute():
             raise ToolPolicyError("relative path components are not allowed")
+        for part in raw_parts:
+            if part != part.rstrip(". "):
+                raise ToolPolicyError("path components must not have trailing dots or spaces")
+            if _RESERVED_DEVICE.fullmatch(part.split(".", 1)[0].rstrip(" ")):
+                raise ToolPolicyError("path uses a reserved device name")
         candidate = (self.root / text).resolve()
         if candidate != self.root and not candidate.is_relative_to(self.root):
             raise ToolPolicyError("path escapes the workspace")
