@@ -68,6 +68,13 @@ receiver:
   committed is ever repeated; the evaluation measures this separately for crashes at commit
   boundaries (0 repeated paid calls) and inside the window (at most the interrupted step).
 
+Tool outputs larger than the runtime's `max_output_bytes` are refused. For a read tool nothing
+happened, so the step is recorded as failed. A side-effecting tool has already been applied when its
+output is measured, so the step is recorded as **completed** with the output's size and SHA-256 in
+place of the output, and the command then raises `ToolPolicyError`, live and on replay. The journal
+never hides an applied effect behind `StepFailed`; workflow code can only roll such an effect back
+with a compensation it can register without the lost output.
+
 ## Workers, leases and fencing
 
 - A worker claims a run atomically under `BEGIN IMMEDIATE`:

@@ -115,6 +115,8 @@ class StepCompletedPayload(_Payload):
     kind: CommandKind
     name: str
     output: JsonValue = None
+    # An applied side effect whose output exceeded the size limit: its size and SHA-256 instead.
+    output_omitted: dict[str, JsonValue] | None = None
     model: str | None = None
     usage: _UsagePayload | None = None
     cost_usd_micros: int = Field(default=0, ge=0)

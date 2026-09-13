@@ -199,6 +199,38 @@ def test_a_decision_forged_in_the_database_for_the_run_starter_halts_the_run(
     assert "ApprovalGranted" not in [r.type for r in harness.journal.load_history("forged")]
 
 
+async def open_ticket(ctx: WorkflowContext, value: JsonValue) -> JsonValue:
+    return await ctx.tool("create_ticket", {"title": "oversized", "body": "result"})
+
+
+def test_an_oversized_write_result_is_journaled_as_applied_and_fails_the_run(
+    harness: Harness,
+) -> None:
+    """Regression: the size check ran after the effect and journaled StepFailed for it."""
+    harness.register("open_ticket", open_ticket, frozenset({"create_ticket", "close_ticket"}))
+    harness.start("open_ticket", run_id="oversized")
+    worker = harness.worker()
+    worker.runtime.max_output_bytes = 10
+    asyncio.run(worker.run_until_idle())
+    harness.approve_pending("oversized")
+    asyncio.run(worker.run_until_idle())
+    run = harness.journal.get_run("oversized")
+    assert run.status is RunStatus.FAILED
+    assert run.error is not None
+    assert run.error["error_type"] == "ToolPolicyError"
+    assert [entry.op for entry in harness.sinks.ledger("oversized")] == ["create"]
+    history = harness.journal.load_history("oversized")
+    step = [r.type for r in history if r.command == 0]
+    assert step == ["ApprovalRequested", "ApprovalGranted", "StepScheduled", "StepCompleted"]
+    completed = next(r.data() for r in history if r.type == "StepCompleted")
+    assert completed["output"] is None
+    assert completed["output_omitted"]["bytes"] > 10
+    assert len(completed["output_omitted"]["sha256"]) == 64
+    outbox = harness.journal.list_outbox(run_id="oversized")
+    assert [(row.tool, row.status) for row in outbox] == [("create_ticket", "done")]
+    assert asyncio.run(replay_check(harness.runtime(), "oversized")).detail == "ToolPolicyError"
+
+
 async def direct_notify(ctx: WorkflowContext, value: JsonValue) -> JsonValue:
     await ctx.tool("notify", {"channel": "ops", "message": "hi"})
     return "sent"

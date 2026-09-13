@@ -60,7 +60,7 @@ from replayable_agent_runtime.agentic.providers.base import (
     acomplete,
 )
 from replayable_agent_runtime.agentic.tools import EffectClass, ToolCallContext, ValidatedCall
-from replayable_agent_runtime.core.canonical import CanonicalJSONError, canonical_json
+from replayable_agent_runtime.core.canonical import CanonicalJSONError, canonical_json, sha256_hex
 from replayable_agent_runtime.runtime.budget import RunBudget, fold_budget, limits_from_payload
 from replayable_agent_runtime.runtime.db import now_us
 from replayable_agent_runtime.runtime.errors import (
@@ -131,6 +131,13 @@ def rebuild_error(data: Mapping[str, Any]) -> Exception:
     if cls is ActivityFailedError or cls is None:
         return ActivityFailedError(message, error_type=error_type)
     return cls(message)
+
+
+def _output_omitted_error(tool_name: str) -> ToolPolicyError:
+    """Raised live and on replay for an applied step whose output exceeded the size limit."""
+    return ToolPolicyError(
+        f"output of {tool_name} exceeds the size limit; the call was applied and journaled"
+    )
 
 
 def _find(records: list[EventRecord], event_type: EventType) -> EventRecord | None:
@@ -584,7 +591,10 @@ class WorkflowContext:
         with self._span(command, kind, name, bool(records)):
             completed = _find(records, EventType.STEP_COMPLETED)
             if completed is not None:
-                return completed.data().get("output")
+                data = completed.data()
+                if data.get("output_omitted") is not None:
+                    raise _output_omitted_error(name)
+                return data.get("output")
             self._raise_recorded(records)
             self._state.mark_head()
             scheduled = _find(records, EventType.STEP_SCHEDULED)
@@ -706,13 +716,19 @@ class WorkflowContext:
 
             return within
 
-        def check_size(value: JsonValue) -> None:
-            if len(canonical_json(value).encode("utf-8")) > state.runtime.max_output_bytes:
+        limit = state.runtime.max_output_bytes
+
+        def measure(value: JsonValue) -> tuple[str, int]:
+            text = canonical_json(value)
+            size = len(text.encode("utf-8"))
+            if size > limit and not tool.has_side_effects:
+                # Nothing was applied, so a plain failure is the truthful record.
                 raise ToolPolicyError(f"output of {tool.name} exceeds the size limit")
+            return text, size
 
         try:
             output = await asyncio.to_thread(validated.run, context, authorized_hash=authorized)
-            check_size(output)
+            output_text, size = measure(output)
         except StaleFencingTokenError as exc:
             state.runtime.metrics.stale_fencing_rejections_total.labels("sink").inc()
             raise FencedOutError(f"sink refused fencing token {lease.fencing}") from exc
@@ -744,18 +760,24 @@ class WorkflowContext:
             )[0]
             raise rebuild_error(failure.data()) from exc
         state.runtime.hooks.after_effect(kind.value, key)
+        payload: dict[str, JsonValue] = {"kind": kind.value, "name": tool.name, "output": output}
+        if size > limit:
+            # A side-effecting call already changed the outside world, so the journal must record
+            # the step as applied (a StepFailed would hide the effect from rollback and audit).
+            # The oversized output is replaced by its size and digest, and the command then fails.
+            payload = {
+                "kind": kind.value,
+                "name": tool.name,
+                "output": None,
+                "output_omitted": {"bytes": size, "sha256": sha256_hex(output_text)},
+            }
         self._append(
             command,
-            [
-                NewEvent(
-                    EventType.STEP_COMPLETED,
-                    {"kind": kind.value, "name": tool.name, "output": output},
-                    command,
-                    fingerprint,
-                )
-            ],
+            [NewEvent(EventType.STEP_COMPLETED, payload, command, fingerprint)],
             within=finish_outbox("done"),
         )
+        if size > limit:
+            raise _output_omitted_error(tool.name)
         return output
 
     # ------------------------------------------------------------------ approvals
