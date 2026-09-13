@@ -1,0 +1,71 @@
+# Local stack: control plane plus two workers sharing one SQLite journal on a named volume.
+# Only locally built images; nothing is pulled at runtime besides the pinned bases.
+#
+# SQLite WAL needs every process on the same host kernel (shared memory for the -shm file), which
+# holds for containers sharing a local volume; it does not hold for network filesystems.
+
+x-hardening: &hardening
+  image: replayable-agent-runtime:local
+  read_only: true
+  tmpfs:
+    - /tmp:size=16m
+  volumes:
+    - rar-data:/data
+  cap_drop:
+    - ALL
+  security_opt:
+    - no-new-privileges:true
+  pids_limit: 128
+  mem_limit: 256m
+  cpus: 1.0
+  restart: unless-stopped
+
+x-environment: &environment
+  APP_ENVIRONMENT: prod
+  APP_LOG_LEVEL: INFO
+  APP_PROVIDER: fake
+  APP_LEASE_SECONDS: "10"
+  APP_HEARTBEAT_SECONDS: "3"
+  APP_POLL_SECONDS: "0.5"
+  # Generate with `uv run rar generate-secret`; leave unset to keep the API closed (401).
+  APP_JWT_SECRET: ${APP_JWT_SECRET:-}
+  # Only with APP_PROVIDER=anthropic; leave unset to stay offline.
+  ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+
+services:
+  api:
+    <<: *hardening
+    build:
+      context: .
+    command: ["serve"]
+    ports:
+      - "127.0.0.1:8000:8000"
+    environment:
+      <<: *environment
+      APP_EMBEDDED_WORKER: "false"
+      APP_WORKER_ID: api
+
+  worker-a:
+    <<: *hardening
+    command: ["worker", "--fake-service-latency", "${RAR_WORKER_A_LATENCY:-0}"]
+    environment:
+      <<: *environment
+      APP_WORKER_ID: worker-a
+    healthcheck:
+      test: ["CMD", "python", "-c", "import sys; sys.exit(0)"]
+    depends_on:
+      - api
+
+  worker-b:
+    <<: *hardening
+    command: ["worker"]
+    environment:
+      <<: *environment
+      APP_WORKER_ID: worker-b
+    healthcheck:
+      test: ["CMD", "python", "-c", "import sys; sys.exit(0)"]
+    depends_on:
+      - api
+
+volumes:
+  rar-data:
