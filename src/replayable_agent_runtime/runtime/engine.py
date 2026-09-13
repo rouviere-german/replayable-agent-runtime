@@ -137,6 +137,23 @@ async def _drive(
                 error={"error_type": "WorkflowCancelled", "compensations_failed": failed},
             )
             return outcome("cancelled")
+        except HistoryLimitExceededError as exc:
+            # Workflow commands reached the cap. The rollback still runs: compensation commands use
+            # the journal's reserve above the cap, and the terminal event always fits.
+            _log.error("history_limit_exceeded", run_id=run_id, limit=exc.limit)
+            overflowed_at = state.next_command - 1
+            ctx.ensure_only_compensations_remain()
+            failed = await ctx.run_compensations()
+            ctx.ensure_history_consumed()
+            state.mark_head()
+            overflow: dict[str, JsonValue] = {
+                "error_type": "HistoryLimitExceededError",
+                "message": str(exc),
+                "compensations_failed": failed,
+                "command": overflowed_at,
+            }
+            journal.finish(lease, NewEvent(EventType.RUN_FAILED, overflow), error=overflow)
+            return outcome("failed", "HistoryLimitExceededError")
         except Exception as exc:  # noqa: BLE001 - a workflow exception fails the run
             ctx.ensure_only_compensations_remain()
             failed = await ctx.run_compensations()
@@ -178,17 +195,6 @@ async def _drive(
     except IntegrityHalt as exc:
         result_block = _block(runtime, claim, f"integrity: {exc}")
         return outcome(result_block.outcome, result_block.detail)
-    except HistoryLimitExceededError as exc:
-        overflow: dict[str, JsonValue] = {
-            "error_type": "HistoryLimitExceededError",
-            "message": str(exc),
-        }
-        _log.error("history_limit_exceeded", run_id=run_id, limit=exc.limit)
-        try:
-            journal.finish(lease, NewEvent(EventType.RUN_FAILED, overflow), error=overflow)
-        except FencedOutError:
-            return outcome("lease_lost")
-        return outcome("failed", "HistoryLimitExceededError")
     except FencedOutError as exc:
         _log.warning("lease_lost", run_id=run_id, fencing=lease.fencing, detail=str(exc)[:200])
         return outcome("lease_lost", str(exc))
@@ -212,7 +218,7 @@ async def replay_check(runtime: Runtime, run_id: str) -> ActivationOutcome:
     try:
         try:
             await definition.fn(ctx, state.workflow_input)
-        except (WorkflowCancelled, Exception) as exc:  # noqa: BLE001 - recorded failures replay too
+        except (WorkflowCancelled, HistoryLimitExceededError, Exception) as exc:  # noqa: BLE001 - recorded failures replay too
             # The engine compensated after this failure; replay those commands too.
             ctx.ensure_only_compensations_remain()
             await ctx.run_compensations()

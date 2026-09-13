@@ -321,16 +321,20 @@ class Journal:
         *,
         synchronous: SynchronousMode = "NORMAL",
         max_history_events: int = 10_000,
+        compensation_reserve_events: int = 256,
         clock: Clock = time.time,
         metrics: RuntimeMetrics | None = None,
         migrate: bool = True,
     ) -> None:
         if max_history_events < 2:
             raise ValueError("max_history_events must be at least 2")
+        if compensation_reserve_events < 0:
+            raise ValueError("compensation_reserve_events must not be negative")
         self._path = path
         self._clock = clock
         self._metrics = metrics
         self.max_history_events = max_history_events
+        self.compensation_reserve_events = compensation_reserve_events
         self.synchronous = synchronous
         self._writer = make_engine(path, synchronous=synchronous, immediate=True)
         self._reader = make_engine(path, synchronous=synchronous, immediate=False)
@@ -614,12 +618,20 @@ class Journal:
         *,
         within: TxnHook | None = None,
         run_update: Mapping[str, Any] | None = None,
+        following: int = 0,
+        reserve: bool = False,
     ) -> list[EventRecord]:
         """Append events for the lease holder in one fenced transaction.
 
         ``new_events`` may be a builder called inside the transaction (returning ``None`` appends
         nothing). ``within`` runs extra statements (outbox, inbox) in the same transaction after
         the events are inserted; ``run_update`` sets extra ``runs`` columns.
+
+        History cap: the append fails with ``HistoryLimitExceededError`` if the history would then
+        hold more than ``max_history_events`` events *plus* ``following`` more (the first event of
+        a step passes ``following=1``, so a step never starts unless its completion fits).
+        ``reserve=True`` (compensation commands) may use ``compensation_reserve_events`` more, so a
+        run that hit the cap can still roll back. Terminal events always fit.
         """
         started = time.perf_counter()
         records: list[EventRecord] = []
@@ -640,7 +652,8 @@ class Journal:
             if not built:
                 return []
             final_seq = head.head_seq + len(built)
-            if final_seq + 1 > self.max_history_events and not all(
+            limit = self.max_history_events + (self.compensation_reserve_events if reserve else 0)
+            if final_seq + 1 + following > limit and not all(
                 item.type in TERMINAL_EVENTS for item in built
             ):
                 raise HistoryLimitExceededError(lease.run_id, self.max_history_events)
@@ -831,7 +844,8 @@ class Journal:
                 )
             )
 
-        return self.append(lease, [event], within=insert_row)[0]
+        # following=1: the decision must fit too, or nobody should be asked to approve.
+        return self.append(lease, [event], within=insert_row, following=1)[0]
 
     def get_approval(self, approval_id: str) -> ApprovalRequest:
         with self._reader.connect() as conn:

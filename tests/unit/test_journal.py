@@ -176,6 +176,32 @@ def test_history_limit_fails_loudly_but_still_records_the_terminal_event(
     small.close()
 
 
+def test_the_cap_leaves_room_for_completions_and_a_reserve_for_compensations(
+    tmp_path: Path, clock: FakeClock
+) -> None:
+    small = Journal(
+        tmp_path / "small.db", max_history_events=4, compensation_reserve_events=2, clock=clock
+    )
+    started(small)
+    claim = small.claim("w1", 5)
+    assert claim is not None
+    small.append(claim.lease, [now_event(0), now_event(1)])
+    # One slot is left, but the event announces a follow-up (a completion) that would not fit.
+    with pytest.raises(HistoryLimitExceededError):
+        small.append(claim.lease, [now_event(2)], following=1)
+    small.append(claim.lease, [now_event(2)])
+    with pytest.raises(HistoryLimitExceededError):
+        small.append(claim.lease, [now_event(3)])
+    # Rollback commands may use the reserve above the cap, and no further.
+    small.append(claim.lease, [now_event(3), now_event(4)], reserve=True)
+    with pytest.raises(HistoryLimitExceededError):
+        small.append(claim.lease, [now_event(5)], reserve=True)
+    assert small.get_run("run-1").head_seq == 5
+    with pytest.raises(ValueError, match="compensation_reserve_events"):
+        Journal(tmp_path / "small.db", compensation_reserve_events=-1)
+    small.close()
+
+
 def test_inputs_arriving_during_an_activation_wake_the_run_instead_of_being_lost(
     journal: Journal,
 ) -> None:

@@ -116,8 +116,18 @@ configured budget can only tighten recorded limits.
 ## History cap
 
 Replay cost grows with history length. When an append would take a run past
-`APP_MAX_HISTORY_EVENTS` (default 10,000), the run fails with `HistoryLimitExceededError` (the
-terminal event is still recorded) instead of slowing down every activation. Long-lived processes
+`APP_MAX_HISTORY_EVENTS` (default 10,000), the run fails with `HistoryLimitExceededError` instead of
+slowing down every activation:
+
+- A command's first event is only appended if its follow-up fits too (`StepScheduled` needs room
+  for its completion, `TimerScheduled` for `TimerFired`, `ApprovalRequested` for the decision), so
+  the cap never leaves an external call executed but unrecorded.
+- Registered compensations still run, newest first. Compensation commands may use a reserve of
+  `compensation_reserve_events` (default 256) events above the cap; compensations that do not fit
+  even there count in `compensations_failed`. The terminal `RunFailed` event always fits and records
+  the command that overflowed, so strict replay reproduces the failure.
+
+A history therefore holds at most `APP_MAX_HISTORY_EVENTS` + 256 + 1 events. Long-lived processes
 should be split into child runs; continue-as-new is not implemented.
 
 ## Durability

@@ -188,6 +188,8 @@ class RunFailedPayload(_Payload):
     error_type: str
     message: str
     compensations_failed: int = Field(default=0, ge=0)
+    # For history overflow: the command whose events did not fit (strict replay reproduces it).
+    command: int | None = Field(default=None, ge=0)
 
 
 class RunCancelledPayload(_Payload):

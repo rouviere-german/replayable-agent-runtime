@@ -65,6 +65,7 @@ from replayable_agent_runtime.runtime.budget import RunBudget, fold_budget, limi
 from replayable_agent_runtime.runtime.db import now_us
 from replayable_agent_runtime.runtime.errors import (
     FencedOutError,
+    HistoryLimitExceededError,
     IntegrityHalt,
     NonDeterminismError,
     WorkflowCancelled,
@@ -181,6 +182,15 @@ class ActivationState:
         # Input and starter come from the hash-chained RunStarted event, never the runs row.
         self.workflow_input: JsonValue = started["input"]
         self.started_by = str(started["started_by"])
+        self.history_limit = int(started["max_history_events"])
+        # A run failed by history overflow records the command whose events did not fit, so
+        # strict replay can reproduce the overflow there instead of reporting nondeterminism.
+        self.overflow_command: int | None = None
+        last = history[-1].data() if history[-1].type == EventType.RUN_FAILED else {}
+        if last.get("error_type") == "HistoryLimitExceededError" and isinstance(
+            last.get("command"), int
+        ):
+            self.overflow_command = int(last["command"])
         limits = limits_from_payload(started["budget"])
         if runtime.budget_cap is not None:
             limits = limits.tightest(runtime.budget_cap)
@@ -269,6 +279,9 @@ class WorkflowContext:
                 "with a different fingerprint",
             )
         if not records and state.strict:
+            if command == state.overflow_command:
+                state.next_command += 1
+                raise HistoryLimitExceededError(self.run_id, state.history_limit)
             raise NonDeterminismError(
                 self.run_id, command, f"history ended but workflow issued {kind.value} {name!r}"
             )
@@ -293,6 +306,8 @@ class WorkflowContext:
                 span.set_attribute("rar.seq", records[-1].seq)
 
     def _append(self, command: int, events: list[NewEvent], **kwargs: Any) -> list[EventRecord]:
+        # Rollback commands may use the journal's reserve above the history cap.
+        kwargs.setdefault("reserve", self._state.compensating)
         records = self._state.journal.append(self._state.lease, events, **kwargs)
         self._state.add(command, records)
         return records
@@ -399,6 +414,7 @@ class WorkflowContext:
                             fingerprint,
                         )
                     ],
+                    following=1,
                 )[0]
             key = f"{self.run_id}:{scheduled.seq}"
             runtime = self._state.runtime
@@ -637,7 +653,7 @@ class WorkflowContext:
             fingerprint,
         )
         if not tool.has_side_effects:
-            return self._append(command, [event])[0]
+            return self._append(command, [event], following=1)[0]
 
         def outbox_row(conn: Any, records: Any) -> None:
             record = records[0]
@@ -653,7 +669,7 @@ class WorkflowContext:
                 now=record.recorded_at_us,
             )
 
-        return self._append(command, [event], within=outbox_row)[0]
+        return self._append(command, [event], within=outbox_row, following=1)[0]
 
     async def _execute_tool(
         self,
@@ -929,6 +945,7 @@ class WorkflowContext:
                         fingerprint,
                     )
                 ],
+                following=1,
             )[0]
         fire_at = int(scheduled.data()["fire_at_us"])
         current = now_us(clock)
@@ -989,6 +1006,11 @@ class WorkflowContext:
                 await self._tool_command(CommandKind.COMPENSATION, tool, args)
             except (ActivityFailedError, ToolNotAllowedError, ToolArgumentError, ToolPolicyError):
                 failed += 1
+            except HistoryLimitExceededError:
+                # Not even the compensation reserve has room: nothing more can be recorded, so
+                # this and every remaining compensation count as failed.
+                failed += 1 + len(state.compensations)
+                state.compensations.clear()
         return failed
 
     def patched(self, patch_id: str) -> bool:

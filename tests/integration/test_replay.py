@@ -407,7 +407,57 @@ def test_the_history_cap_fails_the_run_loudly(harness: Harness, tmp_path: Any) -
     assert run.status is RunStatus.FAILED
     assert run.error is not None
     assert run.error["error_type"] == "HistoryLimitExceededError"
-    assert small.get_run("run-1").head_seq == 12
+    # A step is only scheduled if its completion also fits: seq 11 would have been a StepScheduled
+    # whose StepCompleted could not be recorded, so the terminal event takes seq 11 instead.
+    history = small.load_history("run-1")
+    assert small.get_run("run-1").head_seq == 11
+    scheduled = {r.command for r in history if r.type == "StepScheduled"}
+    completed = {r.command for r in history if r.type == "StepCompleted"}
+    assert scheduled == completed
+    small.close()
+
+
+async def ticket_then_loop(ctx: WorkflowContext, value: JsonValue) -> JsonValue:
+    created = await ctx.tool("create_ticket", {"title": "loop", "body": "runaway"})
+    assert isinstance(created, dict)
+    ctx.compensate("close_ticket", {"ticket_id": str(created["ticket_id"])})
+    while True:
+        await ctx.uuid()
+
+
+@pytest.mark.parametrize("crash_after_seq", [None, 15])
+def test_hitting_the_history_cap_still_runs_registered_compensations(
+    harness: Harness, tmp_path: Any, crash_after_seq: int | None
+) -> None:
+    """Regression: history overflow failed the run without rolling back its effects."""
+    small = Journal(tmp_path / "small.db", max_history_events=15, clock=harness.clock)
+    harness.journal = small
+    harness.control = type(harness.control)(
+        small, harness.workflows, default_budget=harness.control.default_budget
+    )
+    harness.register("runaway", ticket_then_loop, frozenset({"create_ticket", "close_ticket"}))
+    run_id = harness.start("runaway")
+    assert asyncio.run(harness.worker().run_once(run_id=run_id)) is not None
+    harness.approve_pending(run_id)
+    if crash_after_seq is not None:
+        injector = CrashInjector([CrashPoint("after_commit", crash_after_seq)])
+        small.append_hooks.append(injector.append_hook)
+        with pytest.raises(SimulatedCrash):
+            asyncio.run(harness.worker().run_once(run_id=run_id))
+        small.append_hooks.clear()
+        assert small.load_history(run_id)[crash_after_seq].data()["kind"] == "compensation"
+        harness.clock.advance(31)
+    run = drive(harness, run_id)
+    assert run.status is RunStatus.FAILED
+    assert run.error is not None
+    assert run.error["error_type"] == "HistoryLimitExceededError"
+    assert run.error["compensations_failed"] == 0
+    assert [entry.op for entry in harness.sinks.ledger(run_id)] == ["create", "close"]
+    history = small.load_history(run_id)
+    assert history[-1].type == "RunFailed"
+    # Workflow commands stopped at the cap; the rollback used the reserve above it.
+    assert len(history) > 15
+    assert asyncio.run(replay_check(harness.runtime(), run_id)).outcome == "failed"
     small.close()
 
 
