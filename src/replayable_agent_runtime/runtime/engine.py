@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import time
 from dataclasses import dataclass, field
-from typing import Literal
+from typing import Literal, Protocol
 
 from opentelemetry.trace import NoOpTracer, Tracer
 from pydantic import JsonValue
@@ -32,15 +32,35 @@ from replayable_agent_runtime.runtime.journal import Claim, Journal, Lease, RunS
 from replayable_agent_runtime.runtime.telemetry import RuntimeMetrics, create_runtime_metrics
 from replayable_agent_runtime.runtime.workflows import UnknownWorkflowError, WorkflowRegistry
 
-__all__ = ["ActivationOutcome", "Hooks", "Outcome", "Runtime", "activate", "replay_check"]
+__all__ = [
+    "ActivationOutcome",
+    "FenceAnnouncer",
+    "Hooks",
+    "Outcome",
+    "Runtime",
+    "activate",
+    "replay_check",
+]
 
 Outcome = Literal["completed", "failed", "cancelled", "waiting", "pending", "blocked", "lease_lost"]
 _log = get_logger("replayable_agent_runtime.engine")
 
 
+class FenceAnnouncer(Protocol):
+    """Something with a fence per run that a new lease holder raises before it runs anything
+    (the bundled :class:`~replayable_agent_runtime.runtime.sinks.SinkStore`)."""
+
+    def announce(self, run_id: str, token: int) -> None: ...
+
+
 class Hooks:
-    """Test seams. ``after_effect`` runs after an external call returns and before its
-    completion is journaled, which is exactly the at-least-once crash window."""
+    """Test seams. ``after_claim`` runs when an activation starts, before the lease's token is
+    announced to the sinks (the window a zombie's write can still land in). ``after_effect`` runs
+    after an external call returns and before its completion is journaled, which is exactly the
+    at-least-once crash window."""
+
+    def after_claim(self, run_id: str, fencing: int) -> None:
+        del run_id, fencing
 
     def after_effect(self, kind: str, key: str) -> None:
         del kind, key
@@ -58,6 +78,8 @@ class Runtime:
     hooks: Hooks = field(default_factory=Hooks)
     budget_cap: BudgetLimits | None = None
     max_output_bytes: int = 64_000
+    # Fencing-aware sinks told about every new lease token before the activation runs.
+    fences: tuple[FenceAnnouncer, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -87,6 +109,12 @@ async def activate(runtime: Runtime, claim: Claim) -> ActivationOutcome:
         span.set_attribute("rar.run_id", lease.run_id)
         span.set_attribute("rar.fencing", lease.fencing)
         span.set_attribute("rar.reclaimed", claim.reclaimed)
+        runtime.hooks.after_claim(lease.run_id, lease.fencing)
+        # Announce this lease's token to every fencing-aware sink before anything is replayed or
+        # re-executed: from here on a paused worker that wakes up inside a sink call is refused,
+        # whether or not this activation has written yet (docs/SEMANTICS.md, sink fencing).
+        for fence in runtime.fences:
+            fence.announce(lease.run_id, lease.fencing)
         history = runtime.journal.load_history(lease.run_id)
         verified = verify_chain(
             history, run_id=lease.run_id, expect_head=(run.head_seq, run.head_hash)

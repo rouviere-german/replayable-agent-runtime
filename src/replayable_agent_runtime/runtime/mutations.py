@@ -297,6 +297,7 @@ def evaluate_mutations(workdir: Path) -> list[MutationResult]:
                 tools=env.tools,
                 provider=FakeProvider(echo_policy),
                 clock=env.clock,
+                fences=(env.sinks,),
             )
             try:
                 outcome = asyncio.run(replay_check(runtime, "base-run"))

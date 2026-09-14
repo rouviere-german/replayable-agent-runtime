@@ -6,7 +6,9 @@ has to handle.
 
 Both sinks remember the highest fencing token they have seen per run and refuse lower tokens, so a
 worker that was paused while holding a lease that has since been reclaimed cannot apply a late
-write (Kleppmann, "How to do distributed locking", 2016).
+write (Kleppmann, "How to do distributed locking", 2016). A new lease holder *announces* its token
+to every sink (:meth:`SinkStore.announce`) before it replays or re-executes anything, so the fence
+is raised from the start of the new activation and not only once the new owner has written.
 
 - :class:`TicketStore` is also idempotent: every write carries the step's ``run_id:seq`` key and a
   repeated key returns the originally stored result without writing again. Effects on it are
@@ -224,6 +226,44 @@ class SinkStore:
         ]
         return entries
 
+    def announce(self, run_id: str, token: int) -> None:
+        """Raise every bundled sink's fence for ``run_id`` to at least ``token``, writing nothing.
+
+        A lease holder calls this when its activation starts. From then on a paused worker that
+        wakes up inside a sink call is refused even though no write has carried the new token yet;
+        the window sink fencing cannot cover is the one between the claim commit and this call
+        (docs/SEMANTICS.md). An announcement never lowers a fence.
+        """
+        with self.engine.begin() as conn:
+            for sink in (TicketStore.sink, Notifier.sink):
+                _record_token(conn, sink=sink, scope=run_id, token=token)
+
+    def fence(self, sink: str, run_id: str) -> int | None:
+        """The highest fencing token a sink has seen for a run (``None`` before any)."""
+        with self.read() as conn:
+            highest = _highest_token(conn, sink=sink, scope=run_id)
+        return highest
+
+
+def _highest_token(conn: Connection, *, sink: str, scope: str) -> int | None:
+    value = conn.execute(
+        select(fences.c.highest_token).where(fences.c.sink == sink, fences.c.scope == scope)
+    ).scalar()
+    return None if value is None else int(value)
+
+
+def _record_token(conn: Connection, *, sink: str, scope: str, token: int) -> None:
+    """Remember ``token`` as the highest seen for ``scope`` if it is; never lower the fence."""
+    highest = _highest_token(conn, sink=sink, scope=scope)
+    if highest is None:
+        conn.execute(insert(fences).values(sink=sink, scope=scope, highest_token=token))
+    elif token > highest:
+        conn.execute(
+            update(fences)
+            .where(fences.c.sink == sink, fences.c.scope == scope)
+            .values(highest_token=token)
+        )
+
 
 class _FencedTxn:
     """Check-and-raise the fencing token, then write, in one ``BEGIN IMMEDIATE`` transaction.
@@ -246,26 +286,11 @@ class _FencedTxn:
     def begin(self) -> Iterator[Connection]:
         stale: tuple[int, int] | None = None
         with self._store.engine.begin() as conn:
-            highest = conn.execute(
-                select(fences.c.highest_token).where(
-                    fences.c.sink == self._sink, fences.c.scope == self._run_id
-                )
-            ).scalar()
+            highest = _highest_token(conn, sink=self._sink, scope=self._run_id)
             if self._enforce and highest is not None and self._token < highest:
-                stale = (self._token, int(highest))
+                stale = (self._token, highest)
             else:
-                if highest is None:
-                    conn.execute(
-                        insert(fences).values(
-                            sink=self._sink, scope=self._run_id, highest_token=self._token
-                        )
-                    )
-                elif self._token > highest:
-                    conn.execute(
-                        update(fences)
-                        .where(fences.c.sink == self._sink, fences.c.scope == self._run_id)
-                        .values(highest_token=self._token)
-                    )
+                _record_token(conn, sink=self._sink, scope=self._run_id, token=self._token)
                 yield conn
         if stale is not None:
             self._store.record_rejection(

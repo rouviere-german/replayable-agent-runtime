@@ -7,8 +7,12 @@
 # 4. Wait past the lease, start worker-b: it reclaims the run with a higher fencing token,
 #    re-executes the interrupted read and parks the run on its approvals; approve them via the CLI.
 # 5. `docker compose unpause worker-a`: its late append must be fenced out.
-# 6. Check: run completed, journal verifies, exactly one ticket write and one notification, and
-#    worker-a logged lease_lost.
+# 6. Check: run completed, journal verifies, exactly one ticket write and one notification were
+#    journaled, and worker-a logged lease_lost.
+#
+# This exercises journal fencing: worker-a is paused inside a read, so its late append (not a sink
+# write) is what gets refused. Sink-level fencing against a paused *writer*, in every wake-up
+# ordering, is covered in-process by tests/integration/test_zombie.py and bench/eval_suites.py.
 set -euo pipefail
 
 cd "$(dirname "$0")/.."

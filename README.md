@@ -75,11 +75,12 @@ the head, commands run live and their events commit before the workflow continue
 **Workers and side effects.** Workers claim runs with an atomic, fencing-token-incrementing update
 under `BEGIN IMMEDIATE` and renew leases from a heartbeat thread, so journal I/O on the event loop
 cannot starve it. Every append is conditional on the lease's owner and token, so a zombie worker
-cannot fork the history. Side-effecting tools write an outbox
-row keyed `run_id:seq` in the same transaction as `StepScheduled`, receive that idempotency key and
-the fencing token, and the bundled sinks refuse stale tokens. Compensations registered with
-`ctx.compensate` run newest first on failure or cancellation. `ctx.patched("id")` lets new code
-branch without breaking in-flight histories.
+cannot fork the history. Every activation announces its token to the sinks before it replays or
+re-executes anything. Side-effecting tools write an outbox row keyed `run_id:seq` in the same
+transaction as `StepScheduled`, receive that idempotency key and the fencing token, and the bundled
+sinks refuse stale tokens. Compensations registered with `ctx.compensate` run newest first on
+failure or cancellation. `ctx.patched("id")` lets new code branch without breaking in-flight
+histories.
 
 **Controls around the model.** Write tools block on a durable approval bound to the exact call hash
 and decided by a different principal; tool output returns to the model inside untrusted-data
@@ -232,8 +233,12 @@ links to evidence in [CLAIMS.md](CLAIMS.md).
 - **Audit:** the journal is hash-chained and anchored by a stored head; `rar audit verify` and the
   tamper suite detect modification, deletion, reordering, truncation and forged appends, and every
   single-byte flip in an export. Runs whose chain does not verify are never replayed.
-- **Zombie workers:** fencing tokens are checked at the journal and at the sinks; stale-token writes
-  are rejected, and a control run without sink fencing shows the duplicate.
+- **Zombie workers:** fencing tokens are checked at the journal and at the sinks, and every
+  activation announces its token to the sinks before it runs. Stale-token writes are rejected
+  whether the zombie wakes after the new owner finished or before the owner's first write; a
+  control run without sink fencing shows the duplicate in both orderings. The one remaining window,
+  a write landing between the claim commit and the announcement, is at least once and deduplicated
+  only by idempotency keys (docs/SEMANTICS.md).
 - **Tools:** the file tool is jailed to its workspace with lexical and `realpath` checks; the HTTP
   tool only reaches allowlisted hostnames, which resolve to bundled in-process fake services.
 - **API:** local-issuer HS256 JWTs with `runs:start`, `runs:signal`, `runs:read` and `runs:approve`
@@ -262,8 +267,10 @@ links to evidence in [CLAIMS.md](CLAIMS.md).
   activity retries with backoff (the Anthropic SDK retries transport errors itself). Signal waits
   have no timeout.
 - **Exactly-once everywhere:** effects are at-least-once in the crash window between an external
-  call and its journal commit, and effectively once only at sinks that honour idempotency keys and
-  fencing tokens. The bundled notifier deliberately has no idempotency keys to show the difference.
+  call and its journal commit, and in the window between a lease claim and the new owner's token
+  announcement to the sinks; they are effectively once only at sinks that honour idempotency keys
+  and fencing tokens. The bundled notifier deliberately has no idempotency keys to show the
+  difference.
 - **Power-loss durability by default:** `synchronous=NORMAL` survives killed processes, not power
   loss; `FULL` is one setting away and slower.
 - **Tamper-proof audit:** the journal is tamper-evident. Someone who can write the database can
@@ -279,6 +286,7 @@ links to evidence in [CLAIMS.md](CLAIMS.md).
   ship, and the template's cassette recording task was removed.
 - **How the chaos harness kills:** workers are killed with SIGKILL at chosen journal offsets (right
   after a commit, or right after an external call returns), not at arbitrary wall-clock instants, and
-  recovery runs in the harness process rather than a second subprocess. The compose zombie test pauses
-  a worker during a read; sink-level fencing against a paused writer is covered by the in-process
-  zombie test.
+  recovery runs in the harness process rather than a second subprocess. The compose zombie test (CI
+  only, never run locally) pauses a worker during a read, so it checks journal fencing: the paused
+  worker's late append is refused. Sink-level fencing against a paused writer, in all three wake-up
+  orderings, is covered by the in-process zombie test and the evaluation suite.

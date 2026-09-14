@@ -115,6 +115,7 @@ def build_services(
         metrics=metrics,
         tracer=tracer,
         budget_cap=budget,
+        fences=(sinks,),
     )
     control = ControlPlane(
         journal,

@@ -352,6 +352,7 @@ class ChaosEnvironment:
             provider=provider,
             clock=self.clock,
             hooks=hooks,
+            fences=(self.sinks,),
         )
 
     def close(self) -> None:

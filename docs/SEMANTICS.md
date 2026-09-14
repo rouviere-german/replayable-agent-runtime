@@ -88,8 +88,16 @@ with a compensation it can register without the lost output.
 - **Journal fencing:** every append checks `owner` and `fencing` inside the same transaction. A
   worker whose lease was reclaimed cannot append (`FencedOutError`), so it cannot fork the history.
 - **Sink fencing:** tool handlers receive the lease's fencing token; the bundled sinks refuse tokens
-  lower than the highest they have seen for the run. A paused worker that wakes up inside a sink call
-  cannot apply its stale write even to a sink without idempotency keys.
+  lower than the highest they have seen for the run. Every activation *announces* its token to every
+  fencing-aware sink before it replays or re-executes anything, so a paused worker that wakes up
+  inside a sink call is refused from the moment the new owner's activation starts, whether or not
+  the owner has written yet, even at a sink without idempotency keys.
+- **The claim window:** between the claim commit and the announcement (one sink transaction later)
+  no sink can know the new token, so a stale write that completes exactly there is applied. It is
+  then treated like a crash inside the effect window: the new owner re-executes the step with the
+  same idempotency key, so the idempotent ticket store deduplicates it and the notifier delivers
+  twice. The journal still refuses the zombie's next append, so it cannot fork the history. Sinks
+  that ignore fencing tokens (most third-party APIs) rely on idempotency keys alone.
 - Lease expiry compares wall-clock timestamps written by different processes. Clock skew between
   workers larger than the lease margin can make a live lease look expired; journal and sink fencing
   still prevent double application, but the work is interrupted. Single-node deployment keeps all

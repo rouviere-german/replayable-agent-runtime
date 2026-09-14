@@ -131,6 +131,7 @@ class Harness:
             metrics=self.journal_metrics(),
             hooks=self.hooks,
             budget_cap=self.budget_cap,
+            fences=(self.sinks,),
         )
 
     def journal_metrics(self) -> Any:

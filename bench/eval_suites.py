@@ -8,7 +8,10 @@ Usage:
   signals, human gates, patches, compensations, failures) with 1-3 random crash points of every
   kind; the recovered run must match an uncrashed run of the same program;
 - provider accounting: paid provider calls repeated for the same step after recovery;
-- zombie worker: stale-token writes rejected with fencing, and duplicated in the control;
+- zombie worker: stale-token writes rejected with fencing whether the zombie wakes after the new
+  owner finished or before the owner's first write (the owner announces its token first), and
+  duplicated in the control; the claim window (a write landing between the claim commit and the
+  announcement) is reported separately and must be deduplicated by the idempotent ticket store;
 - mutation suite: 22 nondeterministic edits (including edits that raise or return early) raise
   NonDeterminismError on strict replay and block an in-flight run through the live engine; patched
   edits replay cleanly and finish the in-flight run;
@@ -35,7 +38,7 @@ from replayable_agent_runtime.runtime.chaos import (
 )
 from replayable_agent_runtime.runtime.mutations import evaluate_mutations
 from replayable_agent_runtime.runtime.tamper import run_db_tamper_suite, run_export_flip_suite
-from replayable_agent_runtime.runtime.zombie import run_zombie_scenario
+from replayable_agent_runtime.runtime.zombie import SinkName, ZombieOrder, run_zombie_scenario
 
 ROOT = Path(__file__).resolve().parents[1]
 RESULTS = ROOT / "bench" / "results" / "eval.json"
@@ -93,35 +96,68 @@ def crash_equivalence(examples: int, seed: int) -> dict[str, float]:
 
 
 def zombie(trials: int) -> dict[str, float]:
+    fenced_orders: tuple[ZombieOrder, ...] = (
+        "owner_writes_first",
+        "zombie_wakes_before_owner_writes",
+    )
     counts = {
         "trials_per_mode": trials,
+        "fenced_orders": len(fenced_orders),
         "fenced_stale_writes": 0,
         "fenced_stale_writes_rejected": 0,
         "fenced_duplicate_applications": 0,
         "control_notifier_duplicate_applications": 0,
         "control_ticket_duplicate_applications": 0,
+        "claim_window_writes": 0,
+        "claim_window_notifier_duplicate_applications": 0,
+        "claim_window_ticket_duplicate_applications": 0,
+        "claim_window_journal_fenced": 0,
     }
+    sinks: tuple[SinkName, ...] = ("notifier", "tickets")
     with tempfile.TemporaryDirectory() as tmp:
         for trial in range(trials):
-            for sink in ("notifier", "tickets"):
-                fenced = run_zombie_scenario(
-                    Path(tmp) / f"fenced-{sink}-{trial}", sink=sink, enforce_fencing=True
+            for order in fenced_orders:
+                for sink in sinks:
+                    fenced = run_zombie_scenario(
+                        Path(tmp) / f"fenced-{sink}-{order}-{trial}",
+                        sink=sink,
+                        enforce_fencing=True,
+                        order=order,
+                    )
+                    counts["fenced_stale_writes"] += 1
+                    counts["fenced_stale_writes_rejected"] += fenced.stale_rejections
+                    counts["fenced_duplicate_applications"] += fenced.duplicate_applications
+                control_notifier = run_zombie_scenario(
+                    Path(tmp) / f"control-notifier-{order}-{trial}",
+                    sink="notifier",
+                    enforce_fencing=False,
+                    order=order,
                 )
-                counts["fenced_stale_writes"] += 1
-                counts["fenced_stale_writes_rejected"] += fenced.stale_rejections
-                counts["fenced_duplicate_applications"] += fenced.duplicate_applications
-            control_notifier = run_zombie_scenario(
-                Path(tmp) / f"control-notifier-{trial}", sink="notifier", enforce_fencing=False
-            )
-            control_tickets = run_zombie_scenario(
-                Path(tmp) / f"control-tickets-{trial}", sink="tickets", enforce_fencing=False
-            )
-            counts["control_notifier_duplicate_applications"] += (
-                control_notifier.duplicate_applications
-            )
-            counts["control_ticket_duplicate_applications"] += (
-                control_tickets.duplicate_applications
-            )
+                control_tickets = run_zombie_scenario(
+                    Path(tmp) / f"control-tickets-{order}-{trial}",
+                    sink="tickets",
+                    enforce_fencing=False,
+                    order=order,
+                )
+                counts["control_notifier_duplicate_applications"] += (
+                    control_notifier.duplicate_applications
+                )
+                counts["control_ticket_duplicate_applications"] += (
+                    control_tickets.duplicate_applications
+                )
+            for sink in sinks:
+                window = run_zombie_scenario(
+                    Path(tmp) / f"claim-window-{sink}-{trial}",
+                    sink=sink,
+                    enforce_fencing=True,
+                    order="zombie_wakes_right_after_the_claim",
+                )
+                counts["claim_window_writes"] += 1
+                label = "ticket" if sink == "tickets" else "notifier"
+                counts[f"claim_window_{label}_duplicate_applications"] += (
+                    window.duplicate_applications
+                )
+                counts["claim_window_journal_fenced"] += int(window.zombie_outcome == "lease_lost")
     result = {key: float(value) for key, value in counts.items()}
     result["stale_write_rejection_rate"] = counts["fenced_stale_writes_rejected"] / max(
         1, counts["fenced_stale_writes"]
@@ -190,8 +226,13 @@ def gates(report: dict[str, dict[str, float]]) -> list[str]:
         "recorded clock and uuid values are stable": crash["unstable_recorded_values"] == 0,
         "every stale-token write is rejected": zombies["stale_write_rejection_rate"] == 1.0,
         "fencing leaves no duplicate application": zombies["fenced_duplicate_applications"] == 0,
-        "the control (fencing off) shows duplicates": (
-            zombies["control_notifier_duplicate_applications"] >= zombies["trials_per_mode"]
+        "the control (fencing off) shows duplicates in every ordering": (
+            zombies["control_notifier_duplicate_applications"]
+            >= zombies["trials_per_mode"] * zombies["fenced_orders"]
+        ),
+        "the claim window is deduplicated by idempotency keys and fenced at the journal": (
+            zombies["claim_window_ticket_duplicate_applications"] == 0
+            and zombies["claim_window_journal_fenced"] == zombies["claim_window_writes"]
         ),
         "at least 20 nondeterministic edits, all detected by strict replay": (
             mutation["nondeterministic_edits"] >= 20

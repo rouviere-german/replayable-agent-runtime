@@ -2,14 +2,22 @@
 
 A worker executes an approved write and freezes inside the sink call (a stop-the-world pause, or
 ``docker pause``). Its lease expires, a second worker reclaims the run with a higher fencing token,
-re-executes the in-flight step and finishes the run. Then the frozen worker resumes and delivers
-its stale write.
+re-executes the in-flight step and finishes the run. The frozen worker resumes and delivers its
+stale write. Three orderings of that wake-up are covered (``order``):
 
-- With fencing enforced, the sink refuses the stale token (recorded as a rejection) and the zombie
-  stops with ``lease_lost``; every step is applied exactly once.
-- The control disables fencing at the sinks. The notifier (no idempotency keys) then delivers the
-  zombie's write a second time, which proves the scenario can fail; the ticket store still
-  deduplicates by idempotency key. Either way the journal itself refuses the zombie's next append.
+- ``owner_writes_first``: the new owner has finished the run before the zombie wakes up;
+- ``zombie_wakes_before_owner_writes``: the owner has claimed the run and announced its token but
+  not yet re-executed the in-flight step, so no sink has seen a write with the new token;
+- ``zombie_wakes_right_after_the_claim``: the zombie writes between the claim commit and the
+  owner's announcement, the one window sink fencing cannot cover (docs/SEMANTICS.md).
+
+With fencing enforced, the first two orderings reject the stale write (recorded as a rejection)
+and the zombie stops with ``lease_lost``; every step is applied exactly once. In the third, the
+write lands before any sink knows the new token, so that step is at least once: the notifier
+delivers it twice, while the ticket store deduplicates by idempotency key. The control disables
+fencing at the sinks: the notifier then delivers the zombie's write a second time in every
+ordering, which proves the scenario can fail. Either way the journal itself refuses the zombie's
+next append.
 """
 
 from __future__ import annotations
@@ -17,6 +25,7 @@ from __future__ import annotations
 import asyncio
 import threading
 from collections import Counter
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal
@@ -30,47 +39,77 @@ from replayable_agent_runtime.runtime.builtin_tools import build_tool_registry
 from replayable_agent_runtime.runtime.chaos import FakeClock, echo_policy
 from replayable_agent_runtime.runtime.context import WorkflowContext
 from replayable_agent_runtime.runtime.control import ControlPlane
-from replayable_agent_runtime.runtime.engine import ActivationOutcome, Runtime
+from replayable_agent_runtime.runtime.engine import ActivationOutcome, Hooks, Runtime
 from replayable_agent_runtime.runtime.journal import Journal, RunStatus
 from replayable_agent_runtime.runtime.sinks import SinkStore
 from replayable_agent_runtime.runtime.telemetry import create_runtime_metrics
 from replayable_agent_runtime.runtime.worker import Worker
 from replayable_agent_runtime.runtime.workflows import WorkflowDefinition, WorkflowRegistry
 
-__all__ = ["SinkName", "ZombieOutcome", "run_zombie_scenario"]
+__all__ = ["ORDERS", "SinkName", "ZombieOrder", "ZombieOutcome", "run_zombie_scenario"]
 
 SinkName = Literal["notifier", "tickets"]
+ZombieOrder = Literal[
+    "owner_writes_first",
+    "zombie_wakes_before_owner_writes",
+    "zombie_wakes_right_after_the_claim",
+]
+ORDERS: tuple[ZombieOrder, ...] = (
+    "owner_writes_first",
+    "zombie_wakes_before_owner_writes",
+    "zombie_wakes_right_after_the_claim",
+)
 _TIMEOUT_SECONDS = 30.0
 _TOOLS = frozenset({"paused_notify", "notify", "paused_create_ticket", "update_ticket"})
 
 
 class _PauseGate:
-    """Freezes the first call after it is armed until ``release`` is set."""
+    """Runs one queued action per entry into the paused tool: freeze the caller until released,
+    or wake the frozen zombie while the caller (the new owner) is about to write."""
 
     def __init__(self) -> None:
         self._lock = threading.Lock()
-        self._armed = False
+        self._actions: list[Callable[[], None]] = []
         self.entered = threading.Event()
         self.release = threading.Event()
 
-    def arm(self) -> None:
+    def arm(self, action: Callable[[], None]) -> None:
         with self._lock:
-            self._armed = True
+            self._actions.append(action)
 
-    def maybe_pause(self) -> None:
+    def on_entry(self) -> None:
         with self._lock:
-            armed, self._armed = self._armed, False
-        if armed:
-            self.entered.set()
-            if not self.release.wait(_TIMEOUT_SECONDS):
-                raise TimeoutError("the paused worker was never released")
+            action = self._actions.pop(0) if self._actions else None
+        if action is not None:
+            action()
+
+    def freeze(self) -> None:
+        self.entered.set()
+        if not self.release.wait(_TIMEOUT_SECONDS):
+            raise TimeoutError("the paused worker was never released")
+
+
+class _ClaimWindowHooks(Hooks):
+    """Wakes the frozen zombie inside the claim window (after the claim, before the announcement)
+    of the first activation that starts after the zombie froze."""
+
+    def __init__(self, gate: _PauseGate, wake: Callable[[], None]) -> None:
+        self._gate = gate
+        self._wake = wake
+        self._fired = False
+
+    def after_claim(self, run_id: str, fencing: int) -> None:
+        del run_id, fencing
+        if self._gate.entered.is_set() and not self._fired:
+            self._fired = True
+            self._wake()
 
 
 def _paused(tool: ToolDefinition[Any], gate: _PauseGate) -> ToolDefinition[Any]:
     inner = tool.handler
 
     def handler(args: Any, ctx: ToolCallContext) -> JsonValue:
-        gate.maybe_pause()
+        gate.on_entry()
         return inner(args, ctx)
 
     return ToolDefinition(
@@ -101,6 +140,7 @@ async def _zombie_workflow(ctx: WorkflowContext, value: JsonValue) -> JsonValue:
 class ZombieOutcome:
     sink: str
     fencing_enforced: bool
+    order: str
     zombie_outcome: str
     run_status: str
     stale_rejections: int
@@ -117,7 +157,12 @@ def _approve_pending(control: ControlPlane, run_id: str) -> None:
 
 
 def run_zombie_scenario(
-    workdir: Path, *, sink: SinkName, enforce_fencing: bool, lease_seconds: float = 30.0
+    workdir: Path,
+    *,
+    sink: SinkName,
+    enforce_fencing: bool,
+    lease_seconds: float = 30.0,
+    order: ZombieOrder = "owner_writes_first",
 ) -> ZombieOutcome:
     workdir.mkdir(parents=True, exist_ok=True)
     clock = FakeClock(1_800_000_000.0)
@@ -142,6 +187,20 @@ def run_zombie_scenario(
         control.start_run(
             workflow="zombie", input_value={"sink": sink}, principal="alice", run_id=run_id
         )
+        thread: threading.Thread | None = None
+
+        def wake_zombie() -> None:
+            gate.release.set()
+            if thread is not None:
+                thread.join(_TIMEOUT_SECONDS)
+                if thread.is_alive():
+                    raise TimeoutError("the released zombie did not finish")
+
+        hooks = (
+            _ClaimWindowHooks(gate, wake_zombie)
+            if order == "zombie_wakes_right_after_the_claim"
+            else Hooks()
+        )
 
         def worker(name: str) -> Worker:
             runtime = Runtime(
@@ -151,6 +210,8 @@ def run_zombie_scenario(
                 provider=FakeProvider(echo_policy),
                 clock=clock,
                 metrics=metrics,
+                hooks=hooks,
+                fences=(sinks,),
             )
             return Worker(
                 runtime, worker_id=name, lease_seconds=lease_seconds, heartbeat_seconds=None
@@ -161,7 +222,7 @@ def run_zombie_scenario(
         _approve_pending(control, run_id)
 
         # 2. The zombie executes the approved write and freezes inside the sink call.
-        gate.arm()
+        gate.arm(gate.freeze)
         result: list[ActivationOutcome | BaseException] = []
 
         def zombie_main() -> None:
@@ -178,8 +239,12 @@ def run_zombie_scenario(
         if not gate.entered.wait(_TIMEOUT_SECONDS):
             raise TimeoutError("the zombie never reached the sink call")
 
-        # 3. Its lease expires; a new owner reclaims the run and finishes it.
+        # 3. Its lease expires; a new owner reclaims the run and finishes it. Depending on the
+        #    ordering the zombie wakes up inside the owner's claim window (hooks), right before
+        #    the owner's own write (the armed gate), or only after the run is finished (step 4).
         clock.advance(lease_seconds + 1)
+        if order == "zombie_wakes_before_owner_writes":
+            gate.arm(wake_zombie)
         for _ in range(20):
             run = journal.get_run(run_id)
             if run.terminal:
@@ -189,15 +254,15 @@ def run_zombie_scenario(
                 continue
             asyncio.run(worker("owner").run_once(run_id=run_id))
 
-        # 4. The zombie wakes up and delivers its stale write.
-        gate.release.set()
-        thread.join(_TIMEOUT_SECONDS)
+        # 4. The zombie wakes up (if it has not already) and delivers its stale write.
+        wake_zombie()
         zombie = result[0] if result else None
         zombie_outcome = zombie.outcome if isinstance(zombie, ActivationOutcome) else repr(zombie)
         counts = Counter(entry.seq for entry in sinks.ledger(run_id))
         return ZombieOutcome(
             sink=sink,
             fencing_enforced=enforce_fencing,
+            order=order,
             zombie_outcome=zombie_outcome,
             run_status=journal.get_run(run_id).status.value,
             stale_rejections=len(sinks.rejections(run_id)),

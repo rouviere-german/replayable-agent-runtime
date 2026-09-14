@@ -11,8 +11,9 @@ Measured on a temporary on-disk SQLite journal in WAL mode:
   IMMEDIATE, head check, insert, COMMIT) with a 200-byte payload, ``synchronous=NORMAL`` (default)
   and ``FULL``;
 - ``resume_1k_events``: an external input wakes a parked run with 1,001 journaled events; a worker
-  claims it, loads and hash-verifies the history, replays the workflow to the head and parks it
-  again (the input is not the one the workflow waits for, so no events are appended);
+  claims it, announces its fencing token to the sinks, loads and hash-verifies the history, replays
+  the workflow to the head and parks it again (the input is not the one the workflow waits for, so
+  no events are appended);
 - ``replay_<n>_events``: the same resume at several history lengths;
 - ``verify_chain_1k_events``: hash-chain verification alone.
 
@@ -131,7 +132,8 @@ async def _history_workflow(ctx: WorkflowContext, value: JsonValue) -> JsonValue
 
 
 def bench_resume(workdir: Path, events: int, runs: int) -> tuple[Stats, Stats]:
-    """Time full resumes (claim, load, verify, replay, park) of a run with ``events`` events."""
+    """Time full resumes (claim, announce, load, verify, replay, park) of a run with ``events``
+    events."""
     steps = (events - 1) // 2
     journal = Journal(workdir / f"resume-{events}.db")
     sinks = SinkStore(workdir / f"resume-{events}-sinks.db")
@@ -141,7 +143,11 @@ def bench_resume(workdir: Path, events: int, runs: int) -> tuple[Stats, Stats]:
         )
         tools = build_tool_registry(workspace=workdir / "workspace", sinks=sinks)
         runtime = Runtime(
-            journal=journal, workflows=workflows, tools=tools, provider=FakeProvider(echo_policy)
+            journal=journal,
+            workflows=workflows,
+            tools=tools,
+            provider=FakeProvider(echo_policy),
+            fences=(sinks,),
         )
         ControlPlane(
             journal, workflows, default_budget=BudgetLimits.of(steps=10**6, tokens=1, usd=0.0)

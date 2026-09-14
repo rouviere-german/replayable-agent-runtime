@@ -71,3 +71,30 @@ def test_the_provider_meter_counts_calls_per_step(sinks: SinkStore) -> None:
     assert (meter.calls(), meter.calls("r")) == (4, 3)
     assert meter.duplicates("r") == {"r:2": 2}
     assert meter.duplicates() == {"r:2": 2}
+
+
+def test_announcing_a_token_raises_every_fence_without_writing_and_never_lowers_it(
+    sinks: SinkStore,
+) -> None:
+    tickets = TicketStore(sinks)
+    notifier = Notifier(sinks)
+    sinks.announce("r", 5)
+    assert (sinks.fence("tickets", "r"), sinks.fence("notifier", "r")) == (5, 5)
+    assert sinks.ledger("r") == []
+    # A write with a lower token is stale even though no write carried the announced token.
+    with pytest.raises(StaleFencingTokenError):
+        tickets.create(run_id="r", key="r:1", token=4, title="t", body="b")
+    with pytest.raises(StaleFencingTokenError):
+        notifier.send(run_id="r", key="r:2", token=4, channel="ops", message="m")
+    assert [(r["sink"], r["token"], r["highest_token"]) for r in sinks.rejections("r")] == [
+        ("tickets", 4, 5),
+        ("notifier", 4, 5),
+    ]
+    # The announced token itself and higher ones are accepted; an older announcement is ignored.
+    tickets.create(run_id="r", key="r:3", token=5, title="t", body="b")
+    sinks.announce("r", 3)
+    assert sinks.fence("tickets", "r") == 5
+    notifier.send(run_id="r", key="r:4", token=6, channel="ops", message="m")
+    assert sinks.fence("notifier", "r") == 6
+    # Fences are per run.
+    assert sinks.fence("tickets", "other") is None
