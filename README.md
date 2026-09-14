@@ -170,48 +170,53 @@ which printed "all evaluation gates passed"):
 | Crash equivalence: 500 random programs, 612 injected crashes (before a commit, after a commit, after an external call) | 500/500 recovered runs match the uncrashed run. 417 runs crashed only at commit boundaries and match exactly (result and external-effect ledger); 83 runs crashed inside an effect window and match except for re-delivery of the interrupted step by the non-idempotent notifier |
 | Paid provider calls repeated after recovery | 0 for crashes at commit boundaries; 23 in total for steps interrupted inside their crash window |
 | Journals verified after recovery; recorded clock and uuid values | 500/500 verified; 0 values changed on replay |
-| Zombie worker, 10 trials per sink | 20/20 stale-token writes rejected with fencing, 0 duplicate applications. Control without sink fencing: 10/10 duplicate notifications; the ticket store still deduplicated by idempotency key (0 duplicates) |
-| Mutation suite | 20/20 nondeterministic workflow edits raise `NonDeterminismError`; 4/4 edits guarded by `ctx.patched` replay cleanly |
-| Tamper suite | Detected 160/160 column modifications, 20/20 deletions, 19/19 reorderings, 3/3 tail truncations, 1/1 forged append and 12,593/12,593 single-byte flips of an export |
+| Zombie worker, 10 trials per sink and wake-up ordering | 40/40 stale-token writes rejected with fencing, 0 duplicate applications, whether the zombie woke after the new owner had finished or before the owner's first write. Control without sink fencing: 20/20 duplicate notifications (10 per ordering); the ticket store still deduplicated by idempotency key (0 duplicates). Claim window (the zombie writes between the claim commit and the owner's token announcement): 10/10 notifications delivered twice, 0/10 duplicate ticket writes, 20/20 zombies fenced out at the journal |
+| Mutation suite | 22/22 nondeterministic workflow edits (including new code that raises or returns early before the history head) raise `NonDeterminismError` on strict replay and leave an in-flight run blocked with nothing appended; 4/4 edits guarded by `ctx.patched` replay cleanly and finish the in-flight run |
+| Tamper suite | Detected 160/160 event column modifications, 20/20 deletions, 19/19 reorderings, 3/3 tail truncations, 1/1 forged append, 3/3 edits of the `runs` columns the chain binds (workflow, input, starter), 36/36 edits of `approvals` rows, and 12,593/12,593 single-byte flips of an export |
 
 **SIGKILL chaos** (`uv run python bench/chaos_sigkill.py --seeds 200 --check`, which printed "all
-seeds recovered" after 313 s): 200 of 200 worker processes were killed, 105 right after a journal
+seeds recovered" after 322.9 s): 200 of 200 worker processes were killed, 105 right after a journal
 commit and 95 right after an external call returned but before its completion was committed.
-200/200 runs recovered to the uncrashed outcome and 200/200 journals verified. Kills right after a
-commit repeated 0 paid provider calls; kills inside an effect window repeated 21, all for the
-interrupted steps. An earlier 200-seed run failed 5 seeds. The cause was the harness, which numbered
-the signals it sends in process memory, so a recovering process restarted the sequence. The fix
-numbers them from the journal, and `tests/integration/test_chaos_harness.py` covers it.
+200/200 runs recovered to the uncrashed outcome, 200/200 journals verified and 0 seeds hit a
+harness error. Kills right after a commit repeated 0 paid provider calls; kills inside an effect
+window repeated 21, all for the interrupted steps. Two earlier harness failures are fixed and
+covered by tests. The harness numbered the signals it sends in process memory, so a recovering
+process restarted the sequence (5 failed seeds; `tests/integration/test_chaos_harness.py`). On
+Windows, the databases of a worker just killed with `TerminateProcess` could still be held by the
+OS, so reopening them raised `disk I/O error` and aborted the whole run without a summary (two runs,
+at seeds 6 and 128); the harness now reopens with exponential backoff, records a seed whose harness
+raises as a failed seed instead of aborting, and ignores temporary-directory cleanup errors
+(`tests/unit/test_sigkill_harness.py`).
 
 **Journal and replay performance** (`uv run python bench/bench_baseline.py --check --markdown BENCHMARKS.md`,
 which printed "all benchmarks within thresholds"; full table in [BENCHMARKS.md](BENCHMARKS.md)):
 
 | benchmark | runs | p50 (ms) | p95 (ms) |
 |---|---:|---:|---:|
-| journal append, `synchronous=NORMAL` (default) | 2000 | 0.808 | 1.855 |
-| journal append, `synchronous=FULL` | 500 | 1.647 | 3.051 |
-| resume a 1,001-event run (claim, load, verify chain, replay, park) | 40 | 55.202 | 57.604 |
-| replay to head, 1,001 events (engine-measured) | 40 | 19.722 | 21.124 |
-| verify the hash chain, 1,001 events | 50 | 15.213 | 16.299 |
+| journal append, `synchronous=NORMAL` (default) | 2000 | 0.796 | 1.299 |
+| journal append, `synchronous=FULL` | 500 | 1.657 | 2.844 |
+| resume a 1,001-event run (claim, announce the token to the sinks, load, verify chain, replay, park) | 40 | 52.511 | 54.981 |
+| replay to head, 1,001 events (engine-measured) | 40 | 18.267 | 19.840 |
+| verify the hash chain, 1,001 events | 50 | 14.174 | 14.918 |
 
 The specification's targets are append p95 below 10 ms and 1k-event resume below 150 ms;
 `bench/thresholds.json` enforces both in CI. Replay grows linearly with history length: p50
-replay-to-head was 1.8 ms at 101 events, 9.9 ms at 501, 19.7 ms at 1,001, 38.7 ms at 2,001 and
-78.1 ms at 4,001 (full resume 9.9, 29.7, 55.2, 104.5 and 206.2 ms), which is why histories are
+replay-to-head was 1.8 ms at 101 events, 9.2 ms at 501, 18.3 ms at 1,001, 36.7 ms at 2,001 and
+81.0 ms at 4,001 (full resume 10.3, 29.6, 52.5, 100.2 and 216.4 ms), which is why histories are
 capped (docs/adr/0002-event-sourced-replay-over-state-snapshots.md). The largest single append over
-2,000 runs took 24.4 ms.
+2,000 runs took 19.9 ms.
 
 **Tests, static checks and demo.**
 
-- `uv run python tasks.py test`: 376 passed and 2 skipped, with 94.86% line and branch coverage
-  against an 85% floor, in 87 s. One skipped test needs symlink rights on Windows; the other only
+- `uv run python tasks.py test`: 420 passed and 2 skipped, with 94.76% line and branch coverage
+  against an 85% floor, in 102 s. One skipped test needs symlink rights on Windows; the other only
   applies to the template repository. This local run used 60 examples per crash-equivalence
   property; CI sets `RAR_CRASH_EXAMPLES=500`.
-- `uv run python tasks.py lint typecheck audit baseline`: ruff clean, mypy --strict clean on 95
+- `uv run python tasks.py lint typecheck audit baseline`: ruff clean, mypy --strict clean on 98
   files, bandit reports no issues, pip-audit finds no known vulnerabilities, and the baseline check
-  passes all 482 checks.
-- `uv run python tasks.py demo`: the worker is killed inside its second knowledge-base read at
-  journal seq 8. After the dead lease expires (3.05 s), a new worker resumes with fencing token 4.
+  passes all 541 checks.
+- `uv run python tasks.py demo` (12 s): the worker is killed inside its second knowledge-base read
+  at journal seq 8. After the dead lease expires (3.03 s), a new worker resumes with fencing token 4.
   It repeats 0 provider calls: 2 before the kill, 5 in total. Both self-approvals are refused, one
   ticket and one notification are written, and the 27-event journal verifies. A one-byte change to
   an exported copy is detected ("payload modified").

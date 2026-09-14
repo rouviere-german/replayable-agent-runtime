@@ -9,24 +9,24 @@ Machine: Windows-10-10.0.19045-SP0, Intel64 Family 6 Model 158 Stepping 10, Genu
 
 | benchmark | runs | p50 (ms) | p95 (ms) | max (ms) |
 |---|---:|---:|---:|---:|
-| journal_append_normal | 2000 | 0.808 | 1.855 | 24.419 |
-| journal_append_full | 500 | 1.647 | 3.051 | 4.158 |
-| resume_101_events | 40 | 9.917 | 11.137 | 11.264 |
-| replay_to_head_101_events | 40 | 1.842 | 2.239 | 2.352 |
-| resume_251_events | 40 | 17.188 | 19.219 | 19.842 |
-| replay_to_head_251_events | 40 | 4.492 | 6.042 | 6.268 |
-| resume_501_events | 40 | 29.749 | 32.04 | 40.487 |
-| replay_to_head_501_events | 40 | 9.907 | 10.943 | 11.274 |
-| resume_1k_events | 40 | 55.202 | 57.604 | 58.56 |
-| replay_to_head_1001_events | 40 | 19.722 | 21.124 | 21.404 |
-| resume_2001_events | 10 | 104.483 | 137.598 | 147.604 |
-| replay_to_head_2001_events | 10 | 38.749 | 62.305 | 79.728 |
-| resume_4001_events | 10 | 206.158 | 222.456 | 232.799 |
-| replay_to_head_4001_events | 10 | 78.122 | 80.441 | 80.568 |
-| verify_chain_1k_events | 50 | 15.213 | 16.299 | 17.494 |
-| llm_request_sha256_10_messages | 2000 | 0.098 | 0.131 | 2.079 |
-| redact_text_1kb | 2000 | 0.243 | 0.322 | 1.691 |
-| rate_limiter_check | 20000 | 0.002 | 0.002 | 1.201 |
+| journal_append_normal | 2000 | 0.796 | 1.299 | 19.917 |
+| journal_append_full | 500 | 1.657 | 2.844 | 5.03 |
+| resume_101_events | 40 | 10.309 | 11.317 | 11.79 |
+| replay_to_head_101_events | 40 | 1.817 | 2.231 | 2.986 |
+| resume_251_events | 40 | 17.345 | 19.964 | 28.185 |
+| replay_to_head_251_events | 40 | 4.471 | 5.41 | 5.927 |
+| resume_501_events | 40 | 29.633 | 40.957 | 49.372 |
+| replay_to_head_501_events | 40 | 9.223 | 13.739 | 17.921 |
+| resume_1k_events | 40 | 52.511 | 54.981 | 58.489 |
+| replay_to_head_1001_events | 40 | 18.267 | 19.84 | 21.294 |
+| resume_2001_events | 10 | 100.233 | 117.79 | 129.903 |
+| replay_to_head_2001_events | 10 | 36.698 | 42.241 | 44.783 |
+| resume_4001_events | 10 | 216.43 | 234.958 | 246.783 |
+| replay_to_head_4001_events | 10 | 80.95 | 89.88 | 92.226 |
+| verify_chain_1k_events | 50 | 14.174 | 14.918 | 16.092 |
+| llm_request_sha256_10_messages | 2000 | 0.097 | 0.121 | 0.932 |
+| redact_text_1kb | 2000 | 0.245 | 0.322 | 0.93 |
+| rate_limiter_check | 20000 | 0.002 | 0.002 | 1.062 |
 
 ## Replay time versus history length
 
@@ -34,9 +34,9 @@ Machine: Windows-10-10.0.19045-SP0, Intel64 Family 6 Model 158 Stepping 10, Genu
 
 | events in history | replay to head p50 (ms) | full resume p50 (ms) |
 |---:|---:|---:|
-| 101 | 1.842 | 9.917 |
-| 251 | 4.492 | 17.188 |
-| 501 | 9.907 | 29.749 |
-| 1001 | 19.722 | 55.202 |
-| 2001 | 38.749 | 104.483 |
-| 4001 | 78.122 | 206.158 |
+| 101 | 1.817 | 10.309 |
+| 251 | 4.471 | 17.345 |
+| 501 | 9.223 | 29.633 |
+| 1001 | 18.267 | 52.511 |
+| 2001 | 36.698 | 100.233 |
+| 4001 | 80.95 | 216.43 |
