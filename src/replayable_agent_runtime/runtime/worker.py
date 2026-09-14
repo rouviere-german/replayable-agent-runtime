@@ -1,4 +1,10 @@
-"""Workers: claim runs under a lease, heartbeat it, activate, and wake due timers."""
+"""Workers: claim runs under a lease, heartbeat it, activate, and wake due timers.
+
+Journal appends are synchronous SQLite transactions made from the activation's coroutine, so a slow
+append blocks the worker's event loop for its duration. Lease renewal therefore runs on a thread of
+its own (the journal is thread-safe): a stalled loop cannot starve the heartbeat and lose a healthy
+worker's run to a reclaim (docs/adr/0006-synchronous-journal-io-and-an-out-of-loop-heartbeat.md).
+"""
 
 from __future__ import annotations
 
@@ -6,6 +12,7 @@ import asyncio
 import contextlib
 import os
 import socket
+import threading
 import time
 from dataclasses import dataclass, field
 
@@ -68,13 +75,15 @@ class Worker:
         self.poll_seconds = poll_seconds
         self.health = health or WorkerHealth(stale_after_seconds=max(10.0, poll_seconds * 20))
 
-    async def _heartbeat(self, lease: Lease, interval: float) -> None:
-        while True:
-            await asyncio.sleep(interval)
+    def _heartbeat(self, lease: Lease, interval: float, stop: threading.Event) -> None:
+        """Renew the lease every ``interval`` seconds until ``stop`` is set or renewal fails."""
+        while not stop.wait(interval):
             renewed = self.runtime.journal.renew(lease, self.lease_seconds)
             self.health.lease_tick()
             if not renewed:
-                _log.warning("lease_renewal_failed", run_id=lease.run_id, fencing=lease.fencing)
+                # After the activation released the run a late renewal is expected to fail.
+                if not stop.is_set():
+                    _log.warning("lease_renewal_failed", run_id=lease.run_id, fencing=lease.fencing)
                 return
 
     async def run_once(self, *, run_id: str | None = None) -> ActivationOutcome | None:
@@ -86,16 +95,22 @@ class Worker:
         self.health.lease_tick()
         if claim is None:
             return None
-        heartbeat: asyncio.Task[None] | None = None
+        stop = threading.Event()
+        heartbeat: threading.Thread | None = None
         if self.heartbeat_seconds is not None:
-            heartbeat = asyncio.create_task(self._heartbeat(claim.lease, self.heartbeat_seconds))
+            heartbeat = threading.Thread(
+                target=self._heartbeat,
+                args=(claim.lease, self.heartbeat_seconds, stop),
+                name=f"rar-heartbeat-{claim.lease.run_id}",
+                daemon=True,
+            )
+            heartbeat.start()
         try:
             outcome = await activate(self.runtime, claim)
         finally:
+            stop.set()
             if heartbeat is not None:
-                heartbeat.cancel()
-                with contextlib.suppress(asyncio.CancelledError):
-                    await heartbeat
+                await asyncio.to_thread(heartbeat.join)
         self.runtime.metrics.activations_total.labels(outcome.outcome).inc()
         _log.info(
             "activation",

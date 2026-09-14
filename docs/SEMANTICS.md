@@ -80,8 +80,11 @@ with a compensation it can register without the lost output.
 - A worker claims a run atomically under `BEGIN IMMEDIATE`:
   `UPDATE runs SET owner=?, fencing=fencing+1, lease_expires_at_us=? WHERE run_id=? AND
   lease_expires_at_us < now RETURNING fencing`. Fencing tokens increase monotonically per run.
-- While it holds the lease, a heartbeat renews it. A worker that stops heartbeating (crash, stop-the-
-  world pause, `docker pause`, network partition from its disk) loses the lease when it expires.
+- While it holds the lease, a heartbeat renews it. The heartbeat runs on a thread of its own, so a
+  slow journal append on the worker's event loop cannot starve it
+  (docs/adr/0006-synchronous-journal-io-and-an-out-of-loop-heartbeat.md). A worker that stops
+  heartbeating (crash, stop-the-world pause, `docker pause`, network partition from its disk) loses
+  the lease when it expires.
 - **Journal fencing:** every append checks `owner` and `fencing` inside the same transaction. A
   worker whose lease was reclaimed cannot append (`FencedOutError`), so it cannot fork the history.
 - **Sink fencing:** tool handlers receive the lease's fencing token; the bundled sinks refuse tokens

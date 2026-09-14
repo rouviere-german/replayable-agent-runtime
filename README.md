@@ -73,8 +73,9 @@ and a fingerprint mismatch raises `NonDeterminismError` (the run is blocked for 
 the head, commands run live and their events commit before the workflow continues.
 
 **Workers and side effects.** Workers claim runs with an atomic, fencing-token-incrementing update
-under `BEGIN IMMEDIATE` and renew leases by heartbeat. Every append is conditional on the lease's
-owner and token, so a zombie worker cannot fork the history. Side-effecting tools write an outbox
+under `BEGIN IMMEDIATE` and renew leases from a heartbeat thread, so journal I/O on the event loop
+cannot starve it. Every append is conditional on the lease's owner and token, so a zombie worker
+cannot fork the history. Side-effecting tools write an outbox
 row keyed `run_id:seq` in the same transaction as `StepScheduled`, receive that idempotency key and
 the fencing token, and the bundled sinks refuse stale tokens. Compensations registered with
 `ctx.compensate` run newest first on failure or cancellation. `ctx.patched("id")` lets new code
@@ -254,7 +255,9 @@ links to evidence in [CLAIMS.md](CLAIMS.md).
   multi-region replication are out of scope (docs/adr/0003-sqlite-wal-synchronous-normal.md).
 - **Long histories:** each activation replays from the start. There is no continue-as-new and no
   sticky cache of running workflows; histories are capped (10,000 events by default) and the run
-  fails loudly above the cap.
+  fails loudly above the cap. Journal appends stay synchronous on the worker's event loop; only the
+  heartbeat is moved off it (docs/adr/0006-synchronous-journal-io-and-an-out-of-loop-heartbeat.md
+  states when offloading or continue-as-new would become necessary).
 - **Retry policies:** failed activities are recorded and re-raised; there are no automatic
   activity retries with backoff (the Anthropic SDK retries transport errors itself). Signal waits
   have no timeout.
