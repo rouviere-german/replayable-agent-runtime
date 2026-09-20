@@ -152,8 +152,11 @@ Routes: `POST /v1/runs` (runs:start), `GET /v1/runs`, `GET /v1/runs/{id}`, `GET 
 `/readyz` (database, scheduler loop, lease loop) and `/metrics` (runs:read).
 
 Containers: `docker compose up --build` runs the API and two workers on a shared volume, non-root
-with a read-only root filesystem. Image build, smoke test, trivy, SBOM and the compose zombie-worker
-test (`docker pause`/`unpause`) run in CI only; Docker was not run while building this repository.
+with a read-only root filesystem (set `RAR_API_PORT` when host port 8000 is taken). Verified locally
+on Docker 29.6.1: the image builds to 63.8 MB, `docker run --rm --entrypoint id` reports
+`uid=10001(app) gid=10001(app)`, the HEALTHCHECK goes healthy and `/healthz` and `/readyz` answer
+200 with the root filesystem read-only, and `docker compose config` validates. hadolint, trivy, the
+CycloneDX SBOM and the compose zombie-worker test (`docker pause`/`unpause`) run in CI only.
 
 ## Results
 

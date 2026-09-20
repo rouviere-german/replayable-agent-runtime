@@ -38,8 +38,10 @@ services:
     build:
       context: .
     command: ["serve"]
+    # Host port only; the container still listens on 8000. Override when 8000 is taken:
+    # RAR_API_PORT=8080 docker compose up --build
     ports:
-      - "127.0.0.1:8000:8000"
+      - "127.0.0.1:${RAR_API_PORT:-8000}:8000"
     environment:
       <<: *environment
       APP_EMBEDDED_WORKER: "false"
@@ -51,8 +53,12 @@ services:
     environment:
       <<: *environment
       APP_WORKER_ID: worker-a
+    # Workers serve no HTTP port, so the image's /healthz probe cannot apply to them, and a probe
+    # that only proves the interpreter starts would report "healthy" for a wedged worker. A stuck
+    # worker is detected by its lease expiring and another worker reclaiming the run with a higher
+    # fencing token (the compose zombie test), not by Docker health.
     healthcheck:
-      test: ["CMD", "python", "-c", "import sys; sys.exit(0)"]
+      disable: true
     depends_on:
       - api
 
@@ -62,8 +68,9 @@ services:
     environment:
       <<: *environment
       APP_WORKER_ID: worker-b
+    # No Docker health for workers; see worker-a.
     healthcheck:
-      test: ["CMD", "python", "-c", "import sys; sys.exit(0)"]
+      disable: true
     depends_on:
       - api
 
